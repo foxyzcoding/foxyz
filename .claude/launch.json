@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "foxyz-playwright-server",
+      "runtimeExecutable": "/usr/local/bin/python3",
+      "runtimeArgs": ["-m", "foxyz", "server"],
+      "port": 3000
+    },
+    {
+      "name": "examples-static-server",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8000", "--directory", "scripts/examples"],
+      "port": 8000
+    },
+    {
+      "name": "build-tester",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["build-tester/scripts/run_tests.py"],
+      "port": 8080
+    },
+    {
+      "name": "service-tester",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["service-tester/run_tests.py"],
+      "port": 8081
+    }
+  ]
+}
