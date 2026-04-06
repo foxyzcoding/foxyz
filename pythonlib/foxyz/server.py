@@ -48,7 +48,8 @@ def launch_server(**kwargs) -> NoReturn:
     config = launch_options(**kwargs)
     nodejs = get_nodejs()
 
-    data = orjson.dumps(to_camel_case_dict(config))
+    cc = {k: v for k, v in to_camel_case_dict(config).items() if v is not None}
+    data = orjson.dumps(cc)
 
     process = subprocess.Popen(  # nosec
         [

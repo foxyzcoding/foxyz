@@ -4,11 +4,11 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "foxyz"
-version = "1.0.0"
+version = "1.0.3"
 description = "Wrapper around Playwright to help launch Foxyz"
 authors = ["AntifoxyzDev"]
 license = "MIT"
-repository = "https://github.com/AntifoxyzDev/foxyz"
+repository = "https://github.com/foxyzcoding/foxyz"
 readme = "README.md"
 keywords = [
     "client",

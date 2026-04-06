@@ -19,10 +19,11 @@ from .exceptions import (
     InvalidOS,
     InvalidPropertyType,
     NonFirefoxFingerprint,
+    UnknownProperty,
 )
-from .fingerprints import from_browserforge, from_preset, generate_fingerprint, get_random_preset, _generate_random_font_subset, _generate_random_voice_subset
-from .geolocation import geoip_allowed, get_geolocation
+from .fingerprints import from_browserforge, generate_fingerprint
 from .ip import Proxy, public_ip, valid_ipv4, valid_ipv6
+from .geolocation import geoip_allowed, get_geolocation
 from .locales import handle_locales
 from .pkgman import OS_NAME, get_path, installed_verstr, launch_path
 from .virtdisplay import VirtualDisplay
@@ -31,35 +32,10 @@ from .webgl import sample_webgl
 
 ListOrString: TypeAlias = Union[Tuple[str, ...], List[str], str]
 
-# Foxyz default browser experience preferences.
-# Enables browsing history, URL suggestions, BFCache (instant back/forward),
-# tab undo, memory cache, and memory saver for long-lived profile sessions.
-BROWSER_PREFS = {
-    # Browsing history
-    'browser.sessionhistory.max_entries': 50,
-    'browser.sessionhistory.max_total_viewers': -1,  # automatic
-    'browser.sessionstore.max_tabs_undo': 10,
-    'browser.sessionstore.max_windows_undo': 3,
-    # Places — stores browsing history for URL bar suggestions
-    'browser.places.interactions.enabled': True,
-    # URL bar suggestions from history and bookmarks
-    'browser.urlbar.suggest.history': True,
-    'browser.urlbar.suggest.bookmark': True,
-    'browser.urlbar.suggest.openpage': True,
-    'browser.urlbar.suggest.clipboard': True,
-    'browser.urlbar.autoFill': True,
-    'browser.urlbar.autoFill.adaptiveHistory.enabled': True,
-    'browser.urlbar.maxRichResults': 10,
-    # Form autofill — remember form inputs
-    'browser.formfill.enable': True,
-    # Smooth scrolling & UI animations
-    'toolkit.cosmeticAnimations.enabled': True,
-    'general.smoothScroll': True,
-    'full-screen-api.transition-duration.enter': '200 200',
-    'full-screen-api.transition-duration.leave': '200 200',
-    # BFCache — instant back/forward navigation
-    'fission.bfcacheInParent': True,
-    # Memory cache — faster page loads
+# Foxyz preferences to cache previous pages and requests
+CACHE_PREFS = {
+    'browser.sessionhistory.max_entries': 10,
+    'browser.sessionhistory.max_total_viewers': -1,
     'browser.cache.memory.enable': True,
     'browser.cache.disk_cache_ssl': True,
     'browser.cache.disk.smart_size.enabled': True,
@@ -93,23 +69,8 @@ def get_env_vars(
             sys.exit(1)
 
     if OS_NAME == 'lin':
-        # https://github.com/coryking/foxyz/commit/f21eeb2850a74cc104fb57e17e0a2fa27b7a2a28
-        # Thanks @coryking
-        # the user_agent_os is either 'lin', 'mac', or 'win' but our fontconfigs directory is 'linux', 'macos', or 'windows'
-        directory_map = {
-            'lin': 'linux',
-            'mac': 'macos',
-            'win': 'windows',
-        }
-        os_dir = directory_map.get(user_agent_os, user_agent_os)
-        fontconfig_path = get_path(os.path.join("fontconfigs", os_dir))
-
-        # assert that fonts.conf exists in the directory
-        if not os.path.exists(os.path.join(fontconfig_path, "fonts.conf")):
-            # puke violently if fonts.conf doesn't exist!!
-            raise FileNotFoundError(
-                f"fonts.conf not found in {fontconfig_path}!  Something ain't right with your foxyz bundle."
-            )
+        fontconfig_path = get_path(os.path.join("fontconfig", user_agent_os))
+        env_vars['FONTCONFIG_PATH'] = fontconfig_path
 
     return env_vars
 
@@ -137,8 +98,7 @@ def validate_config(config_map: Dict[str, str], path: Optional[Path] = None) -> 
     for key, value in config_map.items():
         expected_type = property_types.get(key)
         if not expected_type:
-            print(f'Skipping unknown patch {key} : {value}')
-            continue  # Property not supported by this browser version; skip silently
+            raise UnknownProperty(f"Unknown property {key} in config")
 
         if not validate_type(value, expected_type):
             raise InvalidPropertyType(
@@ -198,31 +158,18 @@ def get_screen_cons(headless: Optional[bool] = None) -> Optional[Screen]:
     """
     Determines a sane viewport size for Foxyz if being ran in headful mode.
     """
-    # Cap screen dimensions to a realistic maximum that covers mainstream
-    # Windows/macOS/Linux displays (up to QHD/2K). This prevents BrowserForge
-    # from picking unusual HiDPI Mac resolutions (e.g. 5120×2134) that would
-    # immediately flag the browser as running on a Mac host.
-    _MAX_W = 2560
-    _MAX_H = 1600  # 16:10 MacBook max; covers 16:9 QHD (1440) comfortably
-
     if headless is False:
-        # In headful mode, apply a standard realistic constraint instead of
-        # skipping (returning None) so BrowserForge never picks Mac 5K sizes.
-        return Screen(max_width=_MAX_W, max_height=_MAX_H)
+        return None  # Skip if headless
     try:
         monitors = get_monitors()
     except Exception:
-        return Screen(max_width=_MAX_W, max_height=_MAX_H)
+        return None  # Skip if there's an error getting the monitors
     if not monitors:
-        return Screen(max_width=_MAX_W, max_height=_MAX_H)
+        return None  # Skip if there are no monitors
 
-    # Use the dimensions from the monitor with greatest screen real estate,
-    # but cap to the realistic maximum to avoid leaking Mac HiDPI display info.
+    # Use the dimensions from the monitor with greatest screen real estate
     monitor = max(monitors, key=lambda m: m.width * m.height)
-    return Screen(
-        max_width=min(monitor.width, _MAX_W),
-        max_height=min(monitor.height, _MAX_H),
-    )
+    return Screen(max_width=monitor.width, max_height=monitor.height)
 
 
 def update_fonts(config: Dict[str, Any], target_os: str) -> None:
@@ -356,13 +303,9 @@ async def async_attach_vd(
     _close = browser.close
 
     async def new_close(*args: Any, **kwargs: Any):
-        try:
-            await _close(*args, **kwargs)
-        except Exception:
-            raise
-        finally:
-            if virtual_display:
-                virtual_display.kill()
+        await _close(*args, **kwargs)
+        if virtual_display:
+            virtual_display.kill()
 
     browser.close = new_close
     browser._virtual_display = virtual_display
@@ -382,13 +325,9 @@ def sync_attach_vd(
     _close = browser.close
 
     def new_close(*args: Any, **kwargs: Any):
-        try:
-            _close(*args, **kwargs)
-        except Exception:
-            raise
-        finally:
-            if virtual_display:
-                virtual_display.kill()
+        _close(*args, **kwargs)
+        if virtual_display:
+            virtual_display.kill()
 
     browser.close = new_close
     browser._virtual_display = virtual_display
@@ -406,7 +345,6 @@ def launch_options(
     disable_coop: Optional[bool] = None,
     webgl_config: Optional[Tuple[str, str]] = None,
     geoip: Optional[Union[str, bool]] = None,
-    geoip_db: Optional[str] = None,
     humanize: Optional[Union[bool, float]] = None,
     locale: Optional[Union[str, List[str]]] = None,
     addons: Optional[List[str]] = None,
@@ -416,12 +354,10 @@ def launch_options(
     screen: Optional[Screen] = None,
     window: Optional[Tuple[int, int]] = None,
     fingerprint: Optional[Fingerprint] = None,
-    fingerprint_preset: Optional[Union[bool, Dict[str, Any]]] = None,
     ff_version: Optional[int] = None,
     headless: Optional[bool] = None,
     main_world_eval: Optional[bool] = None,
     executable_path: Optional[Union[str, Path]] = None,
-    browser: Optional[str] = None,
     firefox_user_prefs: Optional[Dict[str, Any]] = None,
     proxy: Optional[Dict[str, str]] = None,
     enable_cache: Optional[bool] = None,
@@ -438,11 +374,11 @@ def launch_options(
 
     Parameters:
         config (Optional[Dict[str, Any]]):
-            Foxyz properties to use. (read https://github.com/AntifoxyzDev/foxyz/blob/main/README.md)
+            Foxyz properties to use.
         os (Optional[ListOrString]):
             Operating system to use for the fingerprint generation.
             Can be "windows", "macos", "linux", or a list to randomly choose from.
-            Default: ["windows", "macos", "linux"]
+            Default: randomly chosen from ["windows", "macos", "linux"]
         block_images (Optional[bool]):
             Whether to block all images.
         block_webrtc (Optional[bool]):
@@ -455,13 +391,9 @@ def launch_options(
         geoip (Optional[Union[str, bool]]):
             Calculate longitude, latitude, timezone, country, & locale based on the IP address.
             Pass the target IP address to use, or `True` to find the IP address automatically.
-        geoip_db (Optional[str]):
-            Name of the GeoIP database to use (e.g., "MaxMind").
-            If not specified, uses the configured default.
         humanize (Optional[Union[bool, float]]):
             Humanize the cursor movement.
             Takes either `True`, or the MAX duration in seconds of the cursor movement.
-            The cursor typically takes up to 1.5 seconds to move across the window.
         locale (Optional[Union[str, List[str]]]):
             Locale(s) to use in Foxyz. The first listed locale will be used for the Intl API.
         addons (Optional[List[str]]):
@@ -470,45 +402,27 @@ def launch_options(
             Fonts to load into Foxyz (in addition to the default fonts for the target `os`).
             Takes a list of font family names that are installed on the system.
         custom_fonts_only (Optional[bool]):
-            If enabled, OS-specific system fonts will be not be passed to Foxyz.
+            If enabled, OS-specific system fonts will not be passed to Foxyz.
         exclude_addons (Optional[List[DefaultAddons]]):
             Default addons to exclude. Passed as a list of foxyz.DefaultAddons enums.
         screen (Optional[Screen]):
             Constrains the screen dimensions of the generated fingerprint.
-            Takes a browserforge.fingerprints.Screen instance.
         window (Optional[Tuple[int, int]]):
-            Set a fixed window size instead of generating a random one
+            Set a fixed window size instead of generating a random one.
         fingerprint (Optional[Fingerprint]):
-            Use a custom BrowserForge fingerprint. Note: Not all values will be implemented.
-            If not provided, a random fingerprint will be generated based on the provided
-            `os` & `screen` constraints.
-        fingerprint_preset (Optional[Union[bool, Dict[str, Any]]]):
-            Opt into using real fingerprint presets instead of BrowserForge.
-            Pass `True` to use a random bundled preset, or pass a preset dict directly.
-            By default (None), BrowserForge is used for infinite unique fingerprints.
+            Use a custom BrowserForge fingerprint.
         ff_version (Optional[int]):
             Firefox version to use. Defaults to the current Foxyz version.
-            To prevent leaks, only use this for special cases.
         headless (Optional[bool]):
             Whether to run the browser in headless mode. Defaults to False.
-            Note: If you are running linux, passing headless='virtual' to Foxyz & AsyncFoxyz
-            will use Xvfb.
         main_world_eval (Optional[bool]):
             Whether to enable running scripts in the main world.
-            To use this, prepend "mw:" to the script: page.evaluate("mw:" + script).
         executable_path (Optional[Union[str, Path]]):
             Custom Foxyz browser executable path.
-        browser (Optional[str]):
-            Select a specific installed browser version. Can be:
-            - Repo/build like "official/beta.20"
-            - Build alone like "beta.20"
-            - Full version like "134.0.2-beta.20"
-            If not specified, uses the active version.
         firefox_user_prefs (Optional[Dict[str, Any]]):
             Firefox user preferences to set.
         proxy (Optional[Dict[str, str]]):
             Proxy to use for the browser.
-            Note: If geoip is True, a request will be sent through this proxy to find the target IP.
         enable_cache (Optional[bool]):
             Cache previous pages, requests, etc (uses more memory).
         args (Optional[List[str]]):
@@ -518,7 +432,7 @@ def launch_options(
         debug (Optional[bool]):
             Prints the config being sent to Foxyz.
         virtual_display (Optional[str]):
-            Virtual display number. Ex: ':99'. This is handled by Foxyz & AsyncFoxyz.
+            Virtual display number. Ex: ':99'.
         webgl_config (Optional[Tuple[str, str]]):
             Use a specific WebGL vendor/renderer pair. Passed as a tuple of (vendor, renderer).
         **launch_options (Dict[str, Any]):
@@ -579,54 +493,22 @@ def launch_options(
         ff_version_str = installed_verstr().split('.', 1)[0]
 
     # Generate a fingerprint
-    _used_preset = False
-    if fingerprint is not None:
-        # User passed a custom BrowserForge fingerprint
-        if not i_know_what_im_doing:
-            check_custom_fingerprint(fingerprint)
-    elif fingerprint_preset is not None:
-        # User opted into real fingerprint presets
-        if isinstance(fingerprint_preset, dict):
-            preset = fingerprint_preset
-        else:
-            preset = get_random_preset(os=os)
-        if preset:
-            merge_into(config, from_preset(preset, ff_version_str))
-            _used_preset = True
-
-    if not _used_preset and fingerprint is None:
-        # Default: BrowserForge synthetic generation (infinite unique fingerprints)
-        # When no OS is specified, default to the host OS so the fingerprint is
-        # consistent with system resources (fonts, voices, WebGL renderer, etc.).
-        # A Win32 fingerprint on macOS hardware would have non-existent fonts,
-        # wrong voices, and other detectable inconsistencies.
-        _fp_os = os or {'mac': ('macos',), 'win': ('windows',), 'lin': ('linux',)}[OS_NAME]
+    if fingerprint is None:
         fingerprint = generate_fingerprint(
             screen=screen or get_screen_cons(headless or 'DISPLAY' in env),
             window=window,
-            os=_fp_os,
+            os=os,
         )
+    else:
+        # Or use the one passed by the user
+        if not i_know_what_im_doing:
+            check_custom_fingerprint(fingerprint)
 
-    if not _used_preset and fingerprint is not None:
-        # Inject the BrowserForge fingerprint into the config
-        merge_into(
-            config,
-            from_browserforge(fingerprint, ff_version_str),
-        )
-
-    # Set navigator.buildID to the actual browser build date.
-    # Without this, the C++ default of "20181001000000" (LibreWolf privacy value) is used,
-    # which is a strong automation signal on fingerprint checkers.
-    if 'navigator.buildID' not in config:
-        try:
-            import configparser as _cp
-            _ini = _cp.ConfigParser()
-            _ini.read(get_path('application.ini'))
-            _bid = _ini.get('App', 'BuildID', fallback=None)
-            if _bid:
-                config['navigator.buildID'] = _bid
-        except Exception:
-            pass
+    # Inject the fingerprint into the config
+    merge_into(
+        config,
+        from_browserforge(fingerprint, ff_version_str),
+    )
 
     target_os = get_target_os(config)
 
@@ -643,27 +525,11 @@ def launch_options(
             LeakWarning.warn('custom_fonts_only')
         else:
             raise ValueError('No custom fonts were passed, but `custom_fonts_only` is enabled.')
-    elif 'fonts' not in config or not config.get('fonts'):
-        # Use the full OS font list. Font subset randomization (30-78%)
-        # causes "Masking detected" on pixelscan because missing expected
-        # fonts signal font list manipulation.
+    else:
         update_fonts(config, target_os)
 
-    # Generate a unique random voice subset
-    if 'voices' not in config:
-        os_name_v = {'win': 'windows', 'mac': 'macos', 'lin': 'linux'}.get(target_os, 'macos')
-        try:
-            config['voices'] = _generate_random_voice_subset(os_name_v)
-        except Exception:
-            pass
-
-    # Set random seeds for fingerprint noise (per launch)
-    set_into(config, 'fonts:spacing_seed', randint(1, 4_294_967_295))  # nosec
-    set_into(config, 'audio:seed', randint(1, 4_294_967_295))  # nosec
-    set_into(config, 'canvas:seed', randint(1, 4_294_967_295))  # nosec
-    # Canvas anti-aliasing offset (Camoufox original feature)
-    set_into(config, 'canvas:aaOffset', randint(-50, 50))  # nosec
-    set_into(config, 'canvas:aaCapOffset', True)
+    # Set a fixed font spacing seed
+    set_into(config, 'fonts:spacing_seed', randint(0, 1_073_741_823))  # nosec
 
     # Set geolocation
     if geoip:
@@ -684,11 +550,10 @@ def launch_options(
             elif valid_ipv6(geoip):
                 set_into(config, 'webrtc:ipv6', geoip)
 
-        geolocation = get_geolocation(geoip, geoip_db=geoip_db)
+        geolocation = get_geolocation(geoip)
         config.update(geolocation.as_config())
 
     # Raise a warning when a proxy is being used without spoofing geolocation.
-    # This is a very bad idea; the warning cannot be ignored with i_know_what_im_doing.
     elif (
         proxy
         and 'localhost' not in proxy.get('server', '')
@@ -699,16 +564,6 @@ def launch_options(
     # Set locale
     if locale:
         handle_locales(locale, config)
-    elif not is_domain_set(config, 'locale:', 'navigator.language'):
-        # No locale explicitly set — default to en-US to prevent the Intl API
-        # from leaking the real OS locale (e.g. en-GB on a UK/Mac system).
-        # navigator.language in Firefox defaults to en-US via intl.accept_languages,
-        # but Intl.DateTimeFormat().resolvedOptions().locale reads GetDefaultLocale()
-        # which falls back to uloc_getDefault() (OS locale) when nothing is set in
-        # CAMOU_CONFIG. Setting locale:language + locale:region forces both paths to
-        # agree on en-US, eliminating the navigator.language vs Intl API mismatch.
-        config['locale:language'] = 'en'
-        config['locale:region'] = 'US'
 
     # Pass the humanize option
     if humanize:
@@ -719,11 +574,6 @@ def launch_options(
     # Enable the main world context creation
     if main_world_eval:
         set_into(config, 'allowMainWorld', True)
-
-    # Enable memory saver — automatically suspends inactive tabs to free RAM.
-    # Essential for multi-profile scenarios where many browser instances run simultaneously.
-    if 'memorysaver' not in config:
-        set_into(config, 'memorysaver', True)
 
     # Set Firefox user preferences
     if block_images:
@@ -743,9 +593,6 @@ def launch_options(
         # If the user has provided a specific WebGL vendor/renderer pair, use it
         if webgl_config:
             webgl_fp = sample_webgl(target_os, *webgl_config)
-        elif config.get('webGl:vendor') and config.get('webGl:renderer'):
-            # Preset already set vendor/renderer — sample matching WebGL params
-            webgl_fp = sample_webgl(target_os, config['webGl:vendor'], config['webGl:renderer'])
         else:
             webgl_fp = sample_webgl(target_os)
         enable_webgl2 = webgl_fp.pop('webGl2Enabled')
@@ -761,19 +608,18 @@ def launch_options(
             },
         )
 
-    # Apply browser experience prefs (history, BFCache, cache).
-    # Enabled by default for long-lived profile sessions.
-    # Pass enable_cache=False to disable for headless/automation use.
-    if enable_cache is not False:
-        merge_into(firefox_user_prefs, BROWSER_PREFS)
+    # Canvas anti-fingerprinting
+    merge_into(
+        config,
+        {
+            'canvas:aaOffset': randint(-50, 50),  # nosec
+            'canvas:aaCapOffset': True,
+        },
+    )
 
-    # In headful mode, remove all fixed window geometry from the fingerprint config.
-    # This lets Firefox report actual OS window metrics for proper resize behavior.
-    if not headless:
-        for key in ('window.innerWidth', 'window.innerHeight',
-                    'window.outerWidth', 'window.outerHeight',
-                    'window.screenX', 'window.screenY'):
-            config.pop(key, None)
+    # Cache previous pages, requests, etc (uses more memory)
+    if enable_cache:
+        merge_into(firefox_user_prefs, CACHE_PREFS)
 
     # Print the config if debug is enabled
     if debug:
@@ -791,31 +637,15 @@ def launch_options(
     # Prepare the executable path
     if executable_path:
         executable_path = str(executable_path)
-    elif browser:
-        # Select a specific installed browser version
-        from .multiversion import find_installed_version
-
-        browser_path = find_installed_version(browser)
-        if not browser_path:
-            raise ValueError(
-                f"Browser version '{browser}' not found. Run `foxyz list` to see installed versions."
-            )
-        executable_path = launch_path(browser_path)
     else:
         executable_path = launch_path()
 
-    result = {
+    return {
         "executable_path": executable_path,
         "args": args,
         "env": env_vars,
         "firefox_user_prefs": firefox_user_prefs,
+        "proxy": proxy,
         "headless": headless,
         **(launch_options if launch_options is not None else {}),
     }
-    # Only include proxy if it's not None (Playwright 1.55+ validates this)
-    # https://github.com/coryking/foxyz/commit/1336e8e509e8c12a896a09d9ee51f131f739f106
-    # Thanks @coryking
-    if proxy is not None:
-        result["proxy"] = proxy
-
-    return result
