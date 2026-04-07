@@ -278,7 +278,7 @@ class MaxMindDownloader(GitHubDownloader):
     MaxMind database downloader from a GitHub repository.
     """
 
-    def check_asset(self, asset: Dict) -> Optional[str]:
+    def check_asset(self, asset: Dict, release: Optional[Dict] = None) -> Optional[str]:
         # Check for the first -City.mmdb file
         if asset['name'].endswith('-City.mmdb'):
             return asset['browser_download_url']
