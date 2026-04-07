@@ -22,23 +22,25 @@ from .utils import launch_options, sync_attach_vd
 def _macos_activate(executable_path: Optional[str]) -> None:
     """
     On macOS, bring the browser window to the foreground after launch.
-    Uses System Events with the process name (executable stem) so macOS
-    raises the window even when launched from a background process.
-    Runs in a background thread with a short delay to ensure the window
-    is fully created before activation is attempted.
+    Uses `open` on the .app bundle — the macOS-native way to activate
+    an already-running app and raise its windows above all others.
+    Runs in a background thread with a short delay to let the window
+    finish initialising before activation.
     """
     if platform.system() != 'Darwin' or not executable_path:
         return
-    process_name = Path(executable_path).stem  # e.g. "camoufox"
+    app_bundle: Optional[str] = None
+    for parent in Path(executable_path).parents:
+        if parent.suffix == '.app':
+            app_bundle = str(parent)
+            break
+    if not app_bundle:
+        return
 
     def _activate() -> None:
-        time.sleep(1.0)
+        time.sleep(1.5)
         subprocess.call(
-            [
-                'osascript', '-e',
-                f'tell application "System Events" to set frontmost of '
-                f'(first process whose name is "{process_name}") to true',
-            ],
+            ['open', app_bundle],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
