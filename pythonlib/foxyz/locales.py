@@ -156,9 +156,89 @@ def handle_locale(locale: str, ignore_region: bool = False) -> Locale:
     raise InvalidLocale.invalid_input(locale)
 
 
-def handle_locales(locales: Union[str, List[str]], config: Dict[str, Any]) -> None:
+# Secondary language fallback probabilities for non-English primary locales.
+# Based on real browser telemetry — most non-English Windows users also have
+# English as a fallback language in their browser preferences.
+_LANG_SECONDARY_FALLBACKS: Dict[str, List[Tuple[str, float]]] = {
+    'de': [('en-US', 0.75), ('en', 0.75), ('fr', 0.08)],
+    'fr': [('en-US', 0.72), ('en', 0.72)],
+    'es': [('en-US', 0.70), ('en', 0.65)],
+    'pt': [('en-US', 0.65), ('en', 0.60), ('es', 0.20)],
+    'it': [('en-US', 0.68), ('en', 0.65)],
+    'nl': [('en-US', 0.85), ('en', 0.85), ('de', 0.15)],
+    'pl': [('en-US', 0.70), ('en', 0.70)],
+    'ru': [('en-US', 0.55), ('en', 0.50)],
+    'zh': [('en-US', 0.60), ('en', 0.55), ('zh-TW', 0.15)],
+    'ja': [('en-US', 0.55), ('en', 0.50)],
+    'ko': [('en-US', 0.60), ('en', 0.55)],
+    'ar': [('en-US', 0.50), ('en', 0.45)],
+    'tr': [('en-US', 0.55), ('en', 0.50)],
+    'sv': [('en-US', 0.88), ('en', 0.88), ('no', 0.15)],
+    'no': [('en-US', 0.88), ('en', 0.88), ('sv', 0.15)],
+    'fi': [('en-US', 0.85), ('en', 0.85), ('sv', 0.15)],
+    'da': [('en-US', 0.88), ('en', 0.88)],
+    'cs': [('en-US', 0.65), ('en', 0.65), ('sk', 0.20)],
+    'sk': [('en-US', 0.65), ('en', 0.65), ('cs', 0.20)],
+    'hu': [('en-US', 0.62), ('en', 0.60)],
+    'ro': [('en-US', 0.60), ('en', 0.58), ('fr', 0.15)],
+    'vi': [('en-US', 0.55), ('en', 0.50)],
+    'th': [('en-US', 0.55), ('en', 0.50)],
+    'id': [('en-US', 0.65), ('en', 0.62)],
+    'ms': [('en-US', 0.72), ('en', 0.70)],
+    'uk': [('en-US', 0.52), ('en', 0.48), ('ru', 0.35)],
+}
+
+
+def _build_languages_array(primary_locale: Locale, rng=None) -> str:
+    """
+    Build a realistic navigator.languages-style string for locale:all.
+
+    Single-locale case only — multi-locale input goes through the explicit path.
+    Examples:
+      en-US → "en-US, en"
+      de-DE → "de-DE, de, en-US, en"   (75% of the time)
+              "de-DE, de"               (25% of the time)
+      en-GB → "en-GB, en, en-US"        (40% of the time)
+              "en-GB, en"               (60% of the time)
+    """
+    import random  # nosec
+
+    lang = primary_locale.language.lower()
+    region = primary_locale.region or ''
+    primary_str = primary_locale.as_string  # e.g. "de-DE"
+
+    langs: List[str] = [primary_str]
+
+    # Add bare language code when region is present (e.g. "de" for "de-DE")
+    if region and lang not in langs:
+        langs.append(lang)
+
+    if lang == 'en':
+        # English-region locales: optionally append en-US as tertiary fallback
+        # (en-US users never need en-US as fallback — they already are it)
+        if region and region.upper() != 'US':
+            if random.random() < 0.40:  # nosec
+                langs.append('en-US')
+    else:
+        # Non-English: probabilistically add secondary languages
+        fallbacks = _LANG_SECONDARY_FALLBACKS.get(
+            lang,
+            [('en-US', 0.60), ('en', 0.55)],  # default for unknown languages
+        )
+        _rand = rng.random if rng is not None else random.random
+        for secondary, probability in fallbacks:
+            if secondary not in langs and _rand() < probability:
+                langs.append(secondary)
+
+    return ', '.join(langs)
+
+
+def handle_locales(locales: Union[str, List[str]], config: Dict[str, Any],
+                   rng=None) -> None:
     """
     Handles a list of locales.
+    ``rng`` is the session FingerprintRng; pass it so navigator.languages
+    expansion is deterministic in Mode 2 (stable-profile) use.
     """
     if isinstance(locales, str):
         locales = [loc.strip() for loc in locales.split(',')]
@@ -167,14 +247,14 @@ def handle_locales(locales: Union[str, List[str]], config: Dict[str, Any]) -> No
     intl_locale = handle_locale(locales[0])
     config.update(intl_locale.as_config())
 
-    if len(locales) < 2:
-        return
-
-    # If additional locales were passed, validate them.
-    # Note: in this case, we do not need the region.
-    config['locale:all'] = _join_unique(
-        handle_locale(locale, ignore_region=True).as_string for locale in locales
-    )
+    if len(locales) >= 2:
+        # User explicitly provided multiple locales — use them verbatim.
+        config['locale:all'] = _join_unique(
+            handle_locale(locale, ignore_region=True).as_string for locale in locales
+        )
+    elif 'locale:all' not in config:
+        # Single locale: generate a realistic navigator.languages array.
+        config['locale:all'] = _build_languages_array(intl_locale, rng=rng)
 
 
 def _join_unique(seq: Iterable[str]) -> str:

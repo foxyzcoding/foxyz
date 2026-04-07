@@ -75,6 +75,7 @@
   { "property": "AudioContext:maxChannelCount", "type": "uint" },
   { "property": "webGl:renderer", "type": "str" },
   { "property": "webGl:vendor", "type": "str" },
+  { "property": "webGl:noiseSeed", "type": "uint" },
   { "property": "webGl:supportedExtensions", "type": "array" },
   { "property": "webGl2:supportedExtensions", "type": "array" },
   { "property": "webGl:parameters", "type": "dict" },

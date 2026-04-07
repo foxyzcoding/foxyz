@@ -4,7 +4,8 @@ from os import environ
 from os.path import abspath
 from pathlib import Path
 from pprint import pprint
-from random import randint, randrange
+import random  # nosec
+from random import choice, randint, randrange
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast
 
 import numpy as np
@@ -21,7 +22,7 @@ from .exceptions import (
     NonFirefoxFingerprint,
     UnknownProperty,
 )
-from .fingerprints import from_browserforge, generate_fingerprint
+from .fingerprints import FingerprintRng, from_browserforge, generate_fingerprint
 from .ip import Proxy, public_ip, valid_ipv4, valid_ipv6
 from .geolocation import geoip_allowed, get_geolocation
 from .locales import handle_locales
@@ -172,18 +173,361 @@ def get_screen_cons(headless: Optional[bool] = None) -> Optional[Screen]:
     return Screen(max_width=monitor.width, max_height=monitor.height)
 
 
-def update_fonts(config: Dict[str, Any], target_os: str) -> None:
-    """
-    Updates the fonts for the target OS.
-    """
-    with open(os.path.join(os.path.dirname(__file__), "fonts.json"), "rb") as f:
-        fonts = orjson.loads(f.read())[target_os]
+# ---------------------------------------------------------------------------
+# navigator.buildID generator
+#
+# Firefox exposes navigator.buildID as a 14-digit timestamp "YYYYMMDDHHMMSS".
+# Camoufox defaults to the static placeholder "20181001000000" which is a
+# well-known antidetect signature that fingerprint scanners detect immediately.
+# We derive a realistic buildID from the Firefox major version by:
+#   1. Estimating the release date (FF 130 = 2024-09-03, ~28-day cadence)
+#   2. Adding a small rng-derived offset so each session/profile gets a
+#      slightly different build timestamp (Mode 2: stable per profile_seed)
+# ---------------------------------------------------------------------------
+from datetime import date as _date, timedelta as _timedelta
 
-    # Merge with existing fonts
+_FF130_RELEASE = _date(2024, 9, 3)   # Firefox 130.0 release date
+
+
+def _generate_build_id(ff_version_major: int, rng: 'FingerprintRng') -> str:
+    """
+    Generate a realistic navigator.buildID for the given Firefox major version.
+
+    Returns a 14-digit string "YYYYMMDDHHMMSS" that looks like a genuine
+    Mozilla CI build timestamp.
+    """
+    # Estimate the release date from the version number
+    days_offset = (ff_version_major - 130) * 28
+    base = _FF130_RELEASE + _timedelta(days=days_offset)
+
+    # Add ±3 day variation so profiles don't all share the exact same date
+    day_jitter = rng.randint(-3, 3)
+    build_date = base + _timedelta(days=day_jitter)
+
+    # Random time component (build machines produce timestamps throughout the day)
+    hh = rng.randint(0, 23)
+    mm = rng.randint(0, 59)
+    ss = rng.randint(0, 59)
+
+    return f"{build_date.strftime('%Y%m%d')}{hh:02d}{mm:02d}{ss:02d}"
+
+
+# Mapping: locale language → font profile names that MUST be included.
+# Ensures locale-font coherence (Japanese locale → Japanese fonts present).
+_LOCALE_MANDATORY_FONT_PROFILES: Dict[str, List[str]] = {
+    'ja':    ['cjk_japanese'],
+    'ko':    ['cjk_korean'],
+    'zh':    [],   # resolved per region below
+}
+_ZH_SIMPLIFIED_REGIONS  = {'CN', 'SG', 'MY', 'ID'}
+_ZH_TRADITIONAL_REGIONS = {'TW', 'HK', 'MO'}
+
+
+def _mandatory_font_profiles(locale_lang: str, locale_region: str) -> List[str]:
+    """Return font profile names that are mandatory for the given locale."""
+    lang   = locale_lang.lower()
+    region = locale_region.upper()
+
+    if lang == 'zh':
+        if region in _ZH_SIMPLIFIED_REGIONS:
+            return ['cjk_chinese_simplified']
+        if region in _ZH_TRADITIONAL_REGIONS:
+            return ['cjk_chinese_traditional']
+        return ['cjk_chinese_simplified']   # fallback
+    return _LOCALE_MANDATORY_FONT_PROFILES.get(lang, [])
+
+
+def update_fonts(config: Dict[str, Any], target_os: str,
+                 rng: Optional['FingerprintRng'] = None) -> None:
+    """
+    Updates the fonts for the target OS with per-session realistic variation.
+
+    Windows: 2-tier system — core fonts (always present) + optional software
+    profiles (randomly chosen).  Locale-specific profiles are always forced in
+    so a Japanese locale always has Japanese fonts, etc.
+
+    Mac / Linux: original flat list (pool already large enough).
+
+    ``rng`` must be the session's FingerprintRng so fonts are stable in Mode 2.
+    """
+    from .fingerprints import FingerprintRng as _FRng
+    if rng is None:
+        rng = _FRng()   # fallback: fresh random (Mode 1 behaviour)
+
+    profiles_path = os.path.join(os.path.dirname(__file__), "font_profiles.json")
+
+    if target_os == 'win' and os.path.exists(profiles_path):
+        with open(profiles_path, "rb") as f:
+            font_data = orjson.loads(f.read()).get('win', {})
+
+        core_fonts: List[str] = font_data.get('core', [])
+        profiles: Dict[str, Any] = font_data.get('profiles', {})
+
+        if profiles:
+            # ── Mandatory profiles (locale-driven) ────────────────────────
+            locale_lang   = config.get('locale:language', '')
+            locale_region = config.get('locale:region',   '')
+            mandatory = set(_mandatory_font_profiles(locale_lang, locale_region))
+
+            # ── Optional profiles (random selection) ──────────────────────
+            optional_pool = [p for p in profiles if p not in mandatory]
+            opt_weights   = [profiles[p]['weight'] for p in optional_pool]
+
+            num_optional = rng.choices([0, 1, 2], weights=[20, 50, 30])[0]
+            chosen_optional: List[str] = []
+            remaining_names   = optional_pool[:]
+            remaining_weights = opt_weights[:]
+
+            for _ in range(min(num_optional, len(remaining_names))):
+                total = sum(remaining_weights)
+                if not total:
+                    break
+                r = rng.randint(0, total - 1)
+                acc = 0
+                for i, w in enumerate(remaining_weights):
+                    acc += w
+                    if r < acc:
+                        chosen_optional.append(remaining_names[i])
+                        remaining_names.pop(i)
+                        remaining_weights.pop(i)
+                        break
+
+            # ── Build font list ────────────────────────────────────────────
+            optional_fonts: List[str] = []
+            for name in list(mandatory) + chosen_optional:
+                pool = profiles[name]['fonts']
+                # Mandatory profiles: include all; optional: 60–100 %
+                k = (len(pool) if name in mandatory
+                     else rng.randint(max(1, int(len(pool) * 0.60)), len(pool)))
+                optional_fonts.extend(rng.sample(pool, k))
+
+            fonts: List[str] = list(np.unique(core_fonts + optional_fonts).tolist())
+        else:
+            fonts = core_fonts
+    else:
+        with open(os.path.join(os.path.dirname(__file__), "fonts.json"), "rb") as f:
+            fonts = orjson.loads(f.read())[target_os]
+
     if 'fonts' in config:
         config['fonts'] = np.unique(fonts + config['fonts']).tolist()
     else:
         config['fonts'] = fonts
+
+
+# en-US voices that are present even on a minimal Windows install.
+# These are always included when the primary locale is English.
+_WIN_EN_US_CORE_VOICES = {
+    "Microsoft David - English (United States)",
+    "Microsoft Zira - English (United States)",
+    "Microsoft David Desktop - English (United States)",
+}
+
+# Per-session voice count distribution for Windows.
+# (min, max, weight) — based on realistic Windows installs.
+_WIN_VOICE_COUNT_DIST = [
+    (3,  5,  15),   # minimal: clean EN-only install
+    (5,  10, 25),   # typical: Win10 EN + 1-2 language packs
+    (10, 20, 30),   # common: Win10/11 with several language packs
+    (20, 35, 20),   # power user: many languages installed
+    (35, 53, 10),   # fully loaded / enterprise / language enthusiast
+]
+
+
+def _sample_win_voice_count() -> int:
+    """Sample a realistic total voice count for Windows."""
+    total_w = sum(w for _, _, w in _WIN_VOICE_COUNT_DIST)
+    r = randint(0, total_w - 1)  # nosec
+    acc = 0
+    for mn, mx, w in _WIN_VOICE_COUNT_DIST:
+        acc += w
+        if r < acc:
+            return randint(mn, mx)  # nosec
+    return randint(5, 15)  # nosec  # fallback
+
+
+def _make_voice_obj(name: str, lang: str, service_type: str, target_os: str,
+                    is_default: bool) -> Dict[str, Any]:
+    """Build a voice config dict from raw parts."""
+    is_local = service_type == 'local'
+    if target_os == 'win':
+        uri = f"urn:moz-tts:sapi:{name}?{lang}"
+    elif target_os == 'mac':
+        uri = f"urn:moz-tts:osx:{name}?{lang}"
+    else:
+        uri = f"urn:moz-tts:speechd:{name}?{lang}"
+    return {"name": name, "lang": lang, "voiceUri": uri,
+            "isDefault": is_default, "isLocalService": is_local}
+
+
+def update_voices(config: Dict[str, Any], target_os: str,
+                  rng: Optional['FingerprintRng'] = None) -> None:
+    """
+    Injects realistic speech synthesis voices for the target OS.
+
+    Windows: generates a per-session random subset that mimics a realistic
+    installed-voice distribution (3-53 voices).  Guarantees:
+      • ≥ 2 en-US voices (always, David/Zira preferred)
+      • All voices matching the session's primary locale are included
+      • Default voice is always the first en-US voice
+    Mac / Linux: full pool (unchanged behaviour — variety is already large).
+    """
+    with open(os.path.join(os.path.dirname(__file__), "voices.json"), "rb") as f:
+        raw_voices: List[str] = orjson.loads(f.read()).get(target_os, [])
+
+    if not raw_voices:
+        return
+
+    # Parse every entry in the pool
+    parsed: List[Dict[str, str]] = []
+    for voice_str in raw_voices:
+        parts = voice_str.rsplit(':', 2)
+        if len(parts) == 3:
+            name, lang, svc = parts
+            parsed.append({'name': name, 'lang': lang, 'svc': svc, 'raw': voice_str})
+
+    from .fingerprints import FingerprintRng as _FRng
+    if rng is None:
+        rng = _FRng()
+
+    if target_os != 'win':
+        # Mac / Linux: use full pool as before
+        selected = parsed
+    else:
+        # ── Windows: locale-aware random subset (all randomness via rng) ──
+        locale_lang   = config.get('locale:language', 'en')
+        locale_region = config.get('locale:region', 'US')
+        primary_tag   = f"{locale_lang}-{locale_region}"  # e.g. "de-DE"
+
+        en_us_voices     = [v for v in parsed if v['lang'] == 'en-US']
+        primary_voices   = (
+            [v for v in parsed if v['lang'] == primary_tag]
+            if not primary_tag.startswith('en') else []
+        )
+        remaining_voices = [v for v in parsed
+                            if v not in en_us_voices and v not in primary_voices]
+
+        target_count = rng.choices(
+            [rng.randint(mn, mx) for mn, mx, _ in _WIN_VOICE_COUNT_DIST],
+            weights=[w for _, _, w in _WIN_VOICE_COUNT_DIST],
+            k=1,
+        )[0]
+
+        # Always include ≥ 2 en-US voices; prefer the "core" set
+        min_en_us   = rng.randint(2, min(3, len(en_us_voices)))
+        core_en_us  = [v for v in en_us_voices if v['name'] in _WIN_EN_US_CORE_VOICES]
+        extra_en_us = [v for v in en_us_voices if v['name'] not in _WIN_EN_US_CORE_VOICES]
+
+        selected_en_us = core_en_us[:min_en_us]
+        needed = min_en_us - len(selected_en_us)
+        if needed > 0 and extra_en_us:
+            selected_en_us += extra_en_us[:needed]
+
+        # Always include ALL voices for the session's primary locale
+        selected_primary = list(primary_voices)
+
+        # Fill remaining slots from the rest of the pool
+        already = {v['name'] for v in selected_en_us + selected_primary}
+        pool    = [v for v in remaining_voices if v['name'] not in already]
+        slots   = max(0, target_count - len(selected_en_us) - len(selected_primary))
+        selected_others = rng.sample(pool, min(slots, len(pool))) if slots and pool else []
+
+        # en-US first so the default voice is always a recognisable en-US name
+        selected = selected_en_us + selected_primary + selected_others
+
+    # Convert to voice config objects
+    voices: List[Dict[str, Any]] = []
+    first_en_seen = False
+    for v in selected:
+        is_default = False
+        if not first_en_seen and v['lang'].startswith('en'):
+            is_default = True
+            first_en_seen = True
+        voices.append(_make_voice_obj(v['name'], v['lang'], v['svc'], target_os, is_default))
+
+    if voices:
+        config['voices'] = voices
+        config['voices:blockIfNotDefined'] = True
+        config['voices:fakeCompletion'] = True
+
+
+# Timezone pools by locale region — used when no explicit timezone is configured
+_LOCALE_TIMEZONE_MAP: Dict[str, List[str]] = {
+    'US': ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+           'America/Phoenix', 'America/Detroit', 'America/Indiana/Indianapolis'],
+    'GB': ['Europe/London'],
+    'CA': ['America/Toronto', 'America/Vancouver', 'America/Edmonton', 'America/Winnipeg'],
+    'AU': ['Australia/Sydney', 'Australia/Melbourne', 'Australia/Brisbane', 'Australia/Perth'],
+    'DE': ['Europe/Berlin'],
+    'FR': ['Europe/Paris'],
+    'NL': ['Europe/Amsterdam'],
+    'IT': ['Europe/Rome'],
+    'ES': ['Europe/Madrid'],
+    'PL': ['Europe/Warsaw'],
+    'RU': ['Europe/Moscow', 'Asia/Yekaterinburg', 'Asia/Novosibirsk'],
+    'BR': ['America/Sao_Paulo', 'America/Manaus', 'America/Fortaleza'],
+    'IN': ['Asia/Kolkata'],
+    'CN': ['Asia/Shanghai'],
+    'JP': ['Asia/Tokyo'],
+    'KR': ['Asia/Seoul'],
+    'SG': ['Asia/Singapore'],
+    'TR': ['Europe/Istanbul'],
+    'MX': ['America/Mexico_City', 'America/Monterrey', 'America/Tijuana'],
+    'AR': ['America/Argentina/Buenos_Aires'],
+    'ZA': ['Africa/Johannesburg'],
+    'NG': ['Africa/Lagos'],
+    'EG': ['Africa/Cairo'],
+    'SA': ['Asia/Riyadh'],
+    'AE': ['Asia/Dubai'],
+    'IL': ['Asia/Jerusalem'],
+    'PH': ['Asia/Manila'],
+    'ID': ['Asia/Jakarta', 'Asia/Makassar'],
+    'TH': ['Asia/Bangkok'],
+    'VN': ['Asia/Ho_Chi_Minh'],
+    'UA': ['Europe/Kyiv'],
+    'SE': ['Europe/Stockholm'],
+    'NO': ['Europe/Oslo'],
+    'FI': ['Europe/Helsinki'],
+    'DK': ['Europe/Copenhagen'],
+    'CH': ['Europe/Zurich'],
+    'AT': ['Europe/Vienna'],
+    'BE': ['Europe/Brussels'],
+    'PT': ['Europe/Lisbon'],
+    'HU': ['Europe/Budapest'],
+    'RO': ['Europe/Bucharest'],
+    'CZ': ['Europe/Prague'],
+    'GR': ['Europe/Athens'],
+}
+_DEFAULT_TIMEZONE_POOL = ['America/New_York', 'America/Chicago', 'America/Los_Angeles',
+                           'Europe/London', 'Europe/Paris', 'Europe/Berlin',
+                           'Asia/Tokyo', 'Asia/Shanghai', 'Australia/Sydney']
+
+
+def get_default_timezone(config: Dict[str, Any], nav_lang_hint: str = '',
+                         rng: Optional['FingerprintRng'] = None) -> str:
+    """
+    Returns a plausible default timezone based on the locale/region in the config.
+    Priority: explicit locale:region > navigator.language region suffix > random pool.
+    This ensures e.g. en-US fingerprints get American timezones, not Asian ones.
+
+    nav_lang_hint: pass fingerprint.navigator.language directly since browserforge.yml
+    intentionally doesn't map navigator.language to the config dict.
+    """
+    from .fingerprints import FingerprintRng as _FRng
+    _pick = (rng or _FRng()).choice
+
+    # 1. Explicit locale:region key (set by user or handle_locales)
+    region = config.get('locale:region', '')
+    if region and region.upper() in _LOCALE_TIMEZONE_MAP:
+        return _pick(_LOCALE_TIMEZONE_MAP[region.upper()])
+
+    # 2. Extract region from navigator.language in config (if somehow present)
+    nav_lang = config.get('navigator.language', '') or nav_lang_hint
+    if nav_lang and '-' in nav_lang:
+        lang_region = nav_lang.split('-')[-1].upper()
+        if lang_region in _LOCALE_TIMEZONE_MAP:
+            return _pick(_LOCALE_TIMEZONE_MAP[lang_region])
+
+    return _pick(_DEFAULT_TIMEZONE_POOL)
 
 
 def check_custom_fingerprint(fingerprint: Fingerprint) -> None:
@@ -366,6 +710,7 @@ def launch_options(
     i_know_what_im_doing: Optional[bool] = None,
     debug: Optional[bool] = None,
     virtual_display: Optional[str] = None,
+    profile_seed: Optional[int] = None,
     **launch_options: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
@@ -492,12 +837,25 @@ def launch_options(
     else:
         ff_version_str = installed_verstr().split('.', 1)[0]
 
+    # ── Session RNG ──────────────────────────────────────────────────────────
+    # Mode 1 (profile_seed=None): fresh seed every launch → unique identity.
+    # Mode 2 (profile_seed=<int>): fixed seed → identical fingerprint every launch.
+    # ALL fingerprint randomness (screen tier, fonts, voices, seeds…) flows
+    # through this single RNG so the entire identity is reproducible from one int.
+    rng = FingerprintRng(profile_seed)
+
     # Generate a fingerprint
     if fingerprint is None:
+        # Pass user-supplied screen constraint only; the device-tier system inside
+        # generate_fingerprint() selects a coherent (screen, DPR, cores) bundle.
+        # get_screen_cons() was previously used to constrain headless sessions to
+        # the physical monitor, but is no longer needed now that the tier system
+        # always picks realistic resolutions that fit any modern display.
         fingerprint = generate_fingerprint(
-            screen=screen or get_screen_cons(headless or 'DISPLAY' in env),
+            screen=screen,   # None unless user explicitly passed screen=
             window=window,
             os=os,
+            rng=rng,
         )
     else:
         # Or use the one passed by the user
@@ -510,26 +868,26 @@ def launch_options(
         from_browserforge(fingerprint, ff_version_str),
     )
 
+    # Propagate DPR from screen — browserforge.yml intentionally omits this to
+    # avoid the 1.0-only assumption, but our device-tier system assigns DPR
+    # values that are genuinely realistic (1.25 for scaled_hd, 1.5/2.0 for 4K).
+    sc_dpr = getattr(fingerprint.screen, 'devicePixelRatio', None)
+    if sc_dpr and sc_dpr != 1.0:
+        set_into(config, 'window.devicePixelRatio', float(sc_dpr))
+
+    # Set a realistic navigator.buildID derived from the Firefox version.
+    # Camoufox's default "20181001000000" is a well-known antidetect signature —
+    # replace it with a version-consistent timestamp so scanners can't flag it.
+    try:
+        major_v = int(ff_version_str.split('.')[0])
+    except (ValueError, AttributeError):
+        major_v = 130
+    set_into(config, 'navigator.buildID', _generate_build_id(major_v, rng))
+
     target_os = get_target_os(config)
 
     # Set a random window.history.length
-    set_into(config, 'window.history.length', randrange(1, 6))  # nosec
-
-    # Update fonts list
-    if fonts:
-        config['fonts'] = fonts
-
-    if custom_fonts_only:
-        firefox_user_prefs['gfx.bundled-fonts.activate'] = 0
-        if fonts:
-            LeakWarning.warn('custom_fonts_only')
-        else:
-            raise ValueError('No custom fonts were passed, but `custom_fonts_only` is enabled.')
-    else:
-        update_fonts(config, target_os)
-
-    # Set a fixed font spacing seed
-    set_into(config, 'fonts:spacing_seed', randint(0, 1_073_741_823))  # nosec
+    set_into(config, 'window.history.length', rng.randrange(1, 6))
 
     # Set geolocation
     if geoip:
@@ -561,9 +919,46 @@ def launch_options(
     ):
         LeakWarning.warn('proxy_without_geoip')
 
+    # If no timezone was configured (via geoip or explicit config), set a default
+    # based on the fingerprint's locale — prevents real host timezone from leaking.
+    # Pass navigator.language from the fingerprint directly (it's intentionally
+    # not mapped in browserforge.yml to avoid leaking locale as a signal, but we
+    # need it here for timezone consistency).
+    if not config.get('timezone'):
+        fp_nav_lang = getattr(getattr(fingerprint, 'navigator', None), 'language', '') or ''
+        set_into(config, 'timezone', get_default_timezone(config, fp_nav_lang, rng=rng))
+
     # Set locale
     if locale:
-        handle_locales(locale, config)
+        handle_locales(locale, config, rng=rng)
+    elif not is_domain_set(config, 'locale:'):
+        fp_nav_lang = getattr(getattr(fingerprint, 'navigator', None), 'language', '') or ''
+        if fp_nav_lang and len(fp_nav_lang) > 2:
+            try:
+                handle_locales(fp_nav_lang, config, rng=rng)
+            except Exception:
+                pass
+
+    # Update fonts — done AFTER locale is resolved so that locale-mandatory profiles
+    # (e.g. cjk_japanese for ja-JP locale) are correctly detected and included.
+    if fonts:
+        config['fonts'] = fonts
+
+    if custom_fonts_only:
+        firefox_user_prefs['gfx.bundled-fonts.activate'] = 0
+        if fonts:
+            LeakWarning.warn('custom_fonts_only')
+        else:
+            raise ValueError('No custom fonts were passed, but `custom_fonts_only` is enabled.')
+    else:
+        update_fonts(config, target_os, rng=rng)
+
+    # Font spacing seed — derived from session RNG for Mode 2 stability
+    set_into(config, 'fonts:spacing_seed', rng.randint(0, 1_073_741_823))
+
+    # Inject realistic speech synthesis voices — done AFTER locale is resolved so
+    # update_voices() knows the primary locale and can guarantee those voices are included.
+    update_voices(config, target_os, rng=rng)
 
     # Pass the humanize option
     if humanize:
@@ -608,17 +1003,19 @@ def launch_options(
             },
         )
 
-    # Canvas anti-fingerprinting
+    # Canvas anti-fingerprinting — use session RNG so Mode 2 profiles are stable
     merge_into(
         config,
         {
-            'canvas:aaOffset': randint(-50, 50),  # nosec
+            'canvas:aaOffset': rng.randint(-50, 50),
             'canvas:aaCapOffset': True,
         },
     )
-
-    # WebGL pixel-level noise — unique per session to prevent cross-session linking
-    set_into(config, 'webGl:noiseSeed', randint(1, 1_073_741_823))  # nosec
+    # Per-session canvas / audio / WebGL seeds — all derived from the session RNG
+    # so they are stable across launches in Mode 2 (profile_seed provided).
+    set_into(config, 'canvas:seed',    rng.randint(1, 1_073_741_823))
+    set_into(config, 'audio:seed',     rng.randint(1, 1_073_741_823))
+    set_into(config, 'webGl:noiseSeed', rng.randint(1, 1_073_741_823))
 
     # Cache previous pages, requests, etc (uses more memory)
     if enable_cache:
