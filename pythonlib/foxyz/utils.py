@@ -1,5 +1,4 @@
 import os
-import platform
 import sys
 from os import environ
 from os.path import abspath
@@ -465,11 +464,6 @@ def launch_options(
     # Handle virtual display
     if virtual_display:
         env['DISPLAY'] = virtual_display
-
-    # On macOS, pass -foreground so Firefox raises its window instead of
-    # staying in the Dock when launched from a background process.
-    if platform.system() == 'Darwin' and not headless and '-foreground' not in args:
-        args.append('-foreground')
 
     # Warn the user for manual config settings
     if not i_know_what_im_doing:

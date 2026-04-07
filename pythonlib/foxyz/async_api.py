@@ -1,5 +1,8 @@
 import asyncio
+import platform
+import subprocess
 from functools import partial
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, overload
 
 from playwright.async_api import (
@@ -13,6 +16,27 @@ from typing_extensions import Literal
 from foxyz.virtdisplay import VirtualDisplay
 
 from .utils import async_attach_vd, launch_options
+
+
+def _macos_activate(executable_path: Optional[str]) -> None:
+    """
+    On macOS, bring the browser window to the foreground after launch.
+    Walks up from the executable path to find the .app bundle name,
+    then uses osascript to activate it.
+    """
+    if platform.system() != 'Darwin' or not executable_path:
+        return
+    app_name = None
+    for parent in Path(executable_path).parents:
+        if parent.suffix == '.app':
+            app_name = parent.stem
+            break
+    if app_name:
+        subprocess.Popen(
+            ['osascript', '-e', f'tell application "{app_name}" to activate'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 class AsyncFoxyz(PlaywrightContextManager):
@@ -93,8 +117,12 @@ async def AsyncNewBrowser(
     # Persistent context
     if persistent_context:
         context = await playwright.firefox.launch_persistent_context(**from_options)
+        if headless is False:
+            _macos_activate(from_options.get('executable_path'))
         return await async_attach_vd(context, virtual_display)
 
     # Browser
     browser = await playwright.firefox.launch(**from_options)
+    if headless is False:
+        _macos_activate(from_options.get('executable_path'))
     return await async_attach_vd(browser, virtual_display)
