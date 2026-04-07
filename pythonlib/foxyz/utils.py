@@ -617,6 +617,9 @@ def launch_options(
         },
     )
 
+    # WebGL pixel-level noise — unique per session to prevent cross-session linking
+    set_into(config, 'webGl:noiseSeed', randint(1, 1_073_741_823))  # nosec
+
     # Cache previous pages, requests, etc (uses more memory)
     if enable_cache:
         merge_into(firefox_user_prefs, CACHE_PREFS)
