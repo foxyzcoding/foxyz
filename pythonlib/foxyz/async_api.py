@@ -1,10 +1,5 @@
 import asyncio
-import platform
-import subprocess
-import threading
-import time
 from functools import partial
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, overload
 
 from playwright.async_api import (
@@ -19,34 +14,6 @@ from foxyz.virtdisplay import VirtualDisplay
 
 from .utils import async_attach_vd, launch_options
 
-
-def _macos_activate(executable_path: Optional[str]) -> None:
-    """
-    On macOS, bring the browser window to the foreground after launch.
-    Uses `open` on the .app bundle — the macOS-native way to activate
-    an already-running app and raise its windows above all others.
-    Runs in a background thread with a short delay to let the window
-    finish initialising before activation.
-    """
-    if platform.system() != 'Darwin' or not executable_path:
-        return
-    app_bundle: Optional[str] = None
-    for parent in Path(executable_path).parents:
-        if parent.suffix == '.app':
-            app_bundle = str(parent)
-            break
-    if not app_bundle:
-        return
-
-    def _activate() -> None:
-        time.sleep(1.5)
-        subprocess.call(
-            ['open', app_bundle],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    threading.Thread(target=_activate, daemon=True).start()
 
 
 class AsyncFoxyz(PlaywrightContextManager):
@@ -127,12 +94,8 @@ async def AsyncNewBrowser(
     # Persistent context
     if persistent_context:
         context = await playwright.firefox.launch_persistent_context(**from_options)
-        if headless is False:
-            _macos_activate(from_options.get('executable_path'))
         return await async_attach_vd(context, virtual_display)
 
     # Browser
     browser = await playwright.firefox.launch(**from_options)
-    if headless is False:
-        _macos_activate(from_options.get('executable_path'))
     return await async_attach_vd(browser, virtual_display)
