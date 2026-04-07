@@ -1,6 +1,8 @@
 import asyncio
 import platform
 import subprocess
+import threading
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, overload
@@ -21,22 +23,28 @@ from .utils import async_attach_vd, launch_options
 def _macos_activate(executable_path: Optional[str]) -> None:
     """
     On macOS, bring the browser window to the foreground after launch.
-    Walks up from the executable path to find the .app bundle name,
-    then uses osascript to activate it.
+    Uses System Events with the process name (executable stem) so macOS
+    raises the window even when launched from a background process.
+    Runs in a background thread with a short delay to ensure the window
+    is fully created before activation is attempted.
     """
     if platform.system() != 'Darwin' or not executable_path:
         return
-    app_name = None
-    for parent in Path(executable_path).parents:
-        if parent.suffix == '.app':
-            app_name = parent.stem
-            break
-    if app_name:
-        subprocess.Popen(
-            ['osascript', '-e', f'tell application "{app_name}" to activate'],
+    process_name = Path(executable_path).stem  # e.g. "camoufox"
+
+    def _activate() -> None:
+        time.sleep(1.0)
+        subprocess.call(
+            [
+                'osascript', '-e',
+                f'tell application "System Events" to set frontmost of '
+                f'(first process whose name is "{process_name}") to true',
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    threading.Thread(target=_activate, daemon=True).start()
 
 
 class AsyncFoxyz(PlaywrightContextManager):
