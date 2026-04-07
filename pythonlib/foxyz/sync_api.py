@@ -1,3 +1,8 @@
+import platform
+import subprocess
+import threading
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, overload
 
 from playwright.sync_api import (
@@ -12,6 +17,28 @@ from foxyz.virtdisplay import VirtualDisplay
 
 from .exceptions import InvalidProxy
 from .utils import launch_options, sync_attach_vd
+
+
+def _macos_activate(executable_path: Optional[str]) -> None:
+    if platform.system() != 'Darwin' or not executable_path:
+        return
+    app_bundle: Optional[str] = None
+    for parent in Path(executable_path).parents:
+        if parent.suffix == '.app':
+            app_bundle = str(parent)
+            break
+    if not app_bundle:
+        return
+
+    def _activate() -> None:
+        time.sleep(0.3)
+        subprocess.call(
+            ['open', app_bundle],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    threading.Thread(target=_activate, daemon=True).start()
 
 
 
@@ -120,6 +147,8 @@ def NewBrowser(
     # Persistent context
     if persistent_context:
         context = playwright.firefox.launch_persistent_context(**from_options)
+        if headless is False:
+            _macos_activate(from_options.get('executable_path'))
         return sync_attach_vd(context, virtual_display)
 
     # Browser
@@ -129,6 +158,7 @@ def NewBrowser(
     # In headful mode, wrap the browser so new_page()/new_context() apply
     # no_viewport=True by default, making the viewport follow OS window resize.
     if headless is False:
+        _macos_activate(from_options.get('executable_path'))
         browser = _HeadfulBrowserWrapper(browser)
 
     return browser
