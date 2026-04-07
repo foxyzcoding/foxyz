@@ -549,7 +549,7 @@ export class PageAgent {
         false /*aIgnoreRootScrollFrame*/,
         0.0 /*pressure*/,
         0 /*inputSource*/,
-        true /*isDOMEventSynthesized*/,
+        false /*isDOMEventSynthesized — false = isTrusted:true, defeats bot detection*/,
         false /*isWidgetEventSynthesized*/,
         0 /*buttons*/,
         win.windowUtils.DEFAULT_MOUSE_POINTER_ID /* pointerIdentifier */,

@@ -1,0 +1,50 @@
+diff --git a/dom/canvas/CanvasRenderingContext2D.cpp b/dom/canvas/CanvasRenderingContext2D.cpp
+--- a/dom/canvas/CanvasRenderingContext2D.cpp
++++ b/dom/canvas/CanvasRenderingContext2D.cpp
+@@ -10,6 +10,7 @@
+ #include "CanvasFingerprintManager.h"
+ #include "nsPIDOMWindow.h"
+ #include "mozilla/dom/WorkerPrivate.h"
++#include "FontSpacingSeedManager.h"
+ #include "mozilla/dom/WorkerScope.h"
+ #include "CanvasUtils.h"
+ #include "GeckoBindings.h"
+@@ -5220,6 +5220,32 @@
+   double actualBoundingBoxLeft    = offsetX - processor.mBoundingBox.X();
+   double actualBoundingBoxRight   = processor.mBoundingBox.XMost() - offsetX;
+   double actualBoundingBoxAscent  = -processor.mBoundingBox.Y() - baselineAnchor;
+   double actualBoundingBoxDescent =  processor.mBoundingBox.YMost() + baselineAnchor;
+
++  // Foxyz: per-session measureText() noise to defeat OS-platform fingerprinting.
++  //
++  // Root cause: gfxShapedWord caches bypass the HarfBuzz-level noise we apply in
++  // anti-font-fingerprinting.patch — on a warm cache the shaper is never called.
++  // This post-processing step runs unconditionally after all metric computation,
++  // bypassing every caching layer.
++  //
++  // Applied only in MEASURE mode (not DRAW) so visual rendering is unaffected.
++  if (aOp == TextDrawOperation::MEASURE) {
++    uint32_t fontSeed = mozilla::dom::FontSpacingSeedManager::GetSeed(0);
++    if (fontSeed != 0) {
++      // Fold text content into seed for per-string determinism:
++      // same session + same text → same width (consistent within page).
++      // different sessions → different widths (defeats cross-session hash).
++      for (uint32_t i = 0; i < aRawText.Length(); i++) {
++        fontSeed ^= static_cast<uint32_t>(aRawText.CharAt(i)) * 2654435761u;
++        fontSeed  = fontSeed * 1664525u + 1013904223u;
++      }
++      fontSeed = fontSeed * 1664525u + 1013904223u;
++      // ±1.5% multiplicative factor.
++      // For a 70 px "Hello World" this gives ±1.05 px noise —
++      // sufficient to flip any fingerprint hash, imperceptible to users.
++      const double factor = 1.0 +
++          (static_cast<double>(fontSeed & 0xFFFFu) / 65536.0 - 0.5) * 0.03;
++      totalWidth             = static_cast<float>(totalWidth * factor);
++      actualBoundingBoxLeft  *= factor;
++      actualBoundingBoxRight *= factor;
++    }
++  }
++
+   auto baselines = font->GetBaselines(fontOrientation);
+   return MakeUnique<TextMetrics>(
+       totalWidth,
