@@ -688,7 +688,7 @@ def launch_options(
     block_webgl: Optional[bool] = None,
     disable_coop: Optional[bool] = None,
     webgl_config: Optional[Tuple[str, str]] = None,
-    geoip: Optional[Union[str, bool]] = None,
+    geoip: Optional[Union[str, bool]] = True,
     humanize: Optional[Union[bool, float]] = None,
     locale: Optional[Union[str, List[str]]] = None,
     addons: Optional[List[str]] = None,
@@ -890,32 +890,44 @@ def launch_options(
     set_into(config, 'window.history.length', rng.randrange(1, 6))
 
     # Set geolocation
+    # geoip=True (default): auto-resolve IP → MaxMind city-level timezone.
+    # This ensures timezone always matches the apparent IP location:
+    #   - No proxy  → local public IP timezone
+    #   - Proxy     → proxy IP timezone (looked up through the proxy)
+    #   - US proxy  → exact city/state timezone (e.g. America/Chicago for Dallas TX)
+    # Falls back to locale-based timezone if IP lookup or DB lookup fails.
     if geoip:
-        geoip_allowed()  # Assert that geoip is allowed
+        try:
+            geoip_allowed()  # Assert that geoip module + DB are available
 
-        if geoip is True:
-            # Find the user's IP address
-            if proxy:
-                geoip = public_ip(Proxy(**proxy).as_string())
-            else:
-                geoip = public_ip()
+            if geoip is True:
+                # Resolve apparent public IP (via proxy if configured)
+                if proxy:
+                    geoip = public_ip(Proxy(**proxy).as_string())
+                else:
+                    geoip = public_ip()
 
-        # Spoof WebRTC if not blocked
-        if not block_webrtc:
-            if valid_ipv4(geoip):
-                set_into(config, 'webrtc:ipv4', geoip)
-                firefox_user_prefs['network.dns.disableIPv6'] = True
-            elif valid_ipv6(geoip):
-                set_into(config, 'webrtc:ipv6', geoip)
+            # Spoof WebRTC to match geoip IP
+            if not block_webrtc:
+                if valid_ipv4(geoip):
+                    set_into(config, 'webrtc:ipv4', geoip)
+                    firefox_user_prefs['network.dns.disableIPv6'] = True
+                elif valid_ipv6(geoip):
+                    set_into(config, 'webrtc:ipv6', geoip)
 
-        geolocation = get_geolocation(geoip)
-        config.update(geolocation.as_config())
+            geolocation = get_geolocation(geoip)
+            config.update(geolocation.as_config())
 
-    # Raise a warning when a proxy is being used without spoofing geolocation.
-    elif (
+        except Exception:
+            # Fallback: geoip unavailable (network error, missing DB, unknown IP).
+            # Timezone will be set from locale pool below — not ideal but prevents crash.
+            pass
+
+    # Warn when proxy is used but geoip resolution failed/skipped (timezone mismatch risk).
+    if (
         proxy
         and 'localhost' not in proxy.get('server', '')
-        and not is_domain_set(config, 'geolocation')
+        and not is_domain_set(config, 'geolocation:')
     ):
         LeakWarning.warn('proxy_without_geoip')
 
@@ -1011,11 +1023,13 @@ def launch_options(
             'canvas:aaCapOffset': True,
         },
     )
-    # Per-session canvas / audio / WebGL seeds — all derived from the session RNG
+    # Per-session canvas / audio seeds — all derived from the session RNG
     # so they are stable across launches in Mode 2 (profile_seed provided).
+    # NOTE: webGl:noiseSeed intentionally NOT set — WebGL readPixels must return clean data
+    # so the red box hash check on pixelscan matches the expected SHA-256 value.
+    # Canvas 2D noise (canvas:seed) is kept for testCanvas2d=true check.
     set_into(config, 'canvas:seed',    rng.randint(1, 1_073_741_823))
     set_into(config, 'audio:seed',     rng.randint(1, 1_073_741_823))
-    set_into(config, 'webGl:noiseSeed', rng.randint(1, 1_073_741_823))
 
     # Cache previous pages, requests, etc (uses more memory)
     if enable_cache:
