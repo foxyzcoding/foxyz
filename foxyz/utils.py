@@ -1,0 +1,1141 @@
+import os
+import sys
+from os import environ
+from os.path import abspath
+from pathlib import Path
+from pprint import pprint
+import random  # nosec
+from random import choice, randint, randrange
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast
+
+import numpy as np
+import orjson
+from browserforge.fingerprints import Fingerprint, Screen
+from screeninfo import get_monitors
+from typing_extensions import TypeAlias
+from ua_parser import user_agent_parser
+
+from .addons import DefaultAddons, add_default_addons, confirm_paths
+from .exceptions import (
+    InvalidOS,
+    InvalidPropertyType,
+    NonFirefoxFingerprint,
+    UnknownProperty,
+)
+from .fingerprints import FingerprintRng, from_browserforge, generate_fingerprint
+from .ip import Proxy, public_ip, valid_ipv4, valid_ipv6
+from .geolocation import geoip_allowed, get_geolocation
+from .locales import handle_locales
+from .pkgman import OS_NAME, get_path, installed_verstr, launch_path
+from .virtdisplay import VirtualDisplay
+from ._warnings import LeakWarning
+from .webgl import sample_webgl
+
+ListOrString: TypeAlias = Union[Tuple[str, ...], List[str], str]
+
+# One-time flag so font injection only runs once per Python process lifetime
+_fonts_injected: bool = False
+
+
+def _ensure_bundled_fonts() -> None:
+    """
+    Auto-inject cross-OS bundled fonts into the active Foxyz installation if
+    the fonts/ directory is absent or empty.  Called lazily on first launch so
+    users who installed via 'foxyz fetch' before this feature existed get fonts
+    without having to reinstall.
+
+    This is a no-op once fonts are present (idempotent).
+    """
+    global _fonts_injected
+    if _fonts_injected:
+        return
+    _fonts_injected = True
+
+    try:
+        install_path = get_path('').parent if OS_NAME != 'mac' else None
+        # Resolve install root from launch_path
+        lp = launch_path()
+        if OS_NAME == 'mac':
+            # lp = .../Foxyz.app/Contents/MacOS/camoufox
+            # install root = .../  (two levels above Contents/)
+            install_root = Path(lp).parent.parent.parent.parent
+            fonts_check = Path(lp).parent.parent / 'Resources' / 'fonts'
+        else:  # win
+            install_root = Path(lp).parent
+            fonts_check = install_root / 'fonts'
+
+        # If fonts already present, nothing to do
+        if fonts_check.exists() and any(fonts_check.iterdir()):
+            return
+
+        # Trigger injection via multiversion helper
+        from .multiversion import _inject_bundled_fonts
+        _inject_bundled_fonts(install_root)
+
+    except Exception:
+        pass  # Font injection is best-effort; never break the launch
+
+
+# Foxyz preferences to cache previous pages and requests
+CACHE_PREFS = {
+    'browser.sessionhistory.max_entries': 10,
+    'browser.sessionhistory.max_total_viewers': -1,
+    'browser.cache.memory.enable': True,
+    'browser.cache.disk_cache_ssl': True,
+    'browser.cache.disk.smart_size.enabled': True,
+}
+
+
+def get_env_vars(
+    config_map: Dict[str, str], user_agent_os: str
+) -> Dict[str, Union[str, float, bool]]:
+    """
+    Gets a dictionary of environment variables for Foxyz.
+    """
+    env_vars: Dict[str, Union[str, float, bool]] = {}
+    try:
+        updated_config_data = orjson.dumps(config_map)
+    except orjson.JSONEncodeError as e:
+        print(f"Error updating config: {e}")
+        sys.exit(1)
+
+    # Split the config into chunks
+    chunk_size = 2047 if OS_NAME == 'win' else 32767
+    config_str = updated_config_data.decode('utf-8')
+
+    for i in range(0, len(config_str), chunk_size):
+        chunk = config_str[i : i + chunk_size]
+        env_name = f"CAMOU_CONFIG_{(i // chunk_size) + 1}"
+        try:
+            env_vars[env_name] = chunk
+        except Exception as e:
+            print(f"Error setting {env_name}: {e}")
+            sys.exit(1)
+
+    return env_vars
+
+
+def _load_properties(path: Optional[Path] = None) -> Dict[str, str]:
+    """
+    Loads the properties.json file.
+    """
+    if path:
+        prop_file = str(path.parent / "properties.json")
+        if not os.path.exists(prop_file):
+            # macOS: properties.json is in Contents/Resources/, not Contents/MacOS/
+            alt_file = str(path.parent.parent / "Resources" / "properties.json")
+            if os.path.exists(alt_file):
+                prop_file = alt_file
+    else:
+        prop_file = get_path("properties.json")
+    with open(prop_file, "rb") as f:
+        prop_dict = orjson.loads(f.read())
+
+    return {prop['property']: prop['type'] for prop in prop_dict}
+
+
+def validate_config(config_map: Dict[str, str], path: Optional[Path] = None) -> None:
+    """
+    Validates the config map.
+    """
+    property_types = _load_properties(path=path)
+
+    for key, value in config_map.items():
+        expected_type = property_types.get(key)
+        if not expected_type:
+            raise UnknownProperty(f"Unknown property {key} in config")
+
+        if not validate_type(value, expected_type):
+            raise InvalidPropertyType(
+                f"Invalid type for property {key}. Expected {expected_type}, got {type(value).__name__}"
+            )
+
+
+def validate_type(value: Any, expected_type: str) -> bool:
+    """
+    Validates the type of the value.
+    """
+    if expected_type == "str":
+        return isinstance(value, str)
+    elif expected_type == "int":
+        return isinstance(value, int) or (isinstance(value, float) and value.is_integer())
+    elif expected_type == "uint":
+        return (
+            isinstance(value, int) or (isinstance(value, float) and value.is_integer())
+        ) and value >= 0
+    elif expected_type == "double":
+        return isinstance(value, (float, int))
+    elif expected_type == "bool":
+        return isinstance(value, bool)
+    elif expected_type == "array":
+        return isinstance(value, list)
+    elif expected_type == "dict":
+        return isinstance(value, dict)
+    else:
+        return False
+
+
+def get_target_os(config: Dict[str, Any]) -> Literal['mac', 'win']:
+    """
+    Gets the OS from the config if the user agent is set,
+    otherwise returns the OS of the current system.
+    """
+    if config.get("navigator.userAgent"):
+        return determine_ua_os(config["navigator.userAgent"])
+    return OS_NAME
+
+
+def determine_ua_os(user_agent: str) -> Literal['mac', 'win']:
+    """
+    Determines the OS from the user agent string.
+    """
+    parsed_ua = user_agent_parser.ParseOS(user_agent).get('family')
+    if not parsed_ua:
+        raise ValueError("Could not determine OS from user agent")
+    if parsed_ua.startswith("Mac"):
+        return "mac"
+    if parsed_ua.startswith("Windows"):
+        return "win"
+    raise InvalidOS("Unsupported OS. Only Windows and macOS are supported.")
+
+
+def get_screen_cons(headless: Optional[bool] = None) -> Optional[Screen]:
+    """
+    Determines a sane viewport size for Foxyz if being ran in headful mode.
+    """
+    if headless is False:
+        return None  # Skip if headless
+    try:
+        monitors = get_monitors()
+    except Exception:
+        return None  # Skip if there's an error getting the monitors
+    if not monitors:
+        return None  # Skip if there are no monitors
+
+    # Use the dimensions from the monitor with greatest screen real estate
+    monitor = max(monitors, key=lambda m: m.width * m.height)
+    return Screen(max_width=monitor.width, max_height=monitor.height)
+
+
+# ---------------------------------------------------------------------------
+# navigator.buildID generator
+#
+# Firefox exposes navigator.buildID as a 14-digit timestamp "YYYYMMDDHHMMSS".
+# Camoufox defaults to the static placeholder "20181001000000" which is a
+# well-known antidetect signature that fingerprint scanners detect immediately.
+# We derive a realistic buildID from the Firefox major version by:
+#   1. Estimating the release date (FF 130 = 2024-09-03, ~28-day cadence)
+#   2. Adding a small rng-derived offset so each session/profile gets a
+#      slightly different build timestamp (Mode 2: stable per profile_seed)
+# ---------------------------------------------------------------------------
+from datetime import date as _date, timedelta as _timedelta
+
+_FF130_RELEASE = _date(2024, 9, 3)   # Firefox 130.0 release date
+
+
+def _generate_build_id(ff_version_major: int, rng: 'FingerprintRng') -> str:
+    """
+    Generate a realistic navigator.buildID for the given Firefox major version.
+
+    Returns a 14-digit string "YYYYMMDDHHMMSS" that looks like a genuine
+    Mozilla CI build timestamp.
+    """
+    # Estimate the release date from the version number
+    days_offset = (ff_version_major - 130) * 28
+    base = _FF130_RELEASE + _timedelta(days=days_offset)
+
+    # Add ±3 day variation so profiles don't all share the exact same date
+    day_jitter = rng.randint(-3, 3)
+    build_date = base + _timedelta(days=day_jitter)
+
+    # Random time component (build machines produce timestamps throughout the day)
+    hh = rng.randint(0, 23)
+    mm = rng.randint(0, 59)
+    ss = rng.randint(0, 59)
+
+    return f"{build_date.strftime('%Y%m%d')}{hh:02d}{mm:02d}{ss:02d}"
+
+
+# Mapping: locale language → font profile names that MUST be included.
+# Ensures locale-font coherence (Japanese locale → Japanese fonts present).
+_LOCALE_MANDATORY_FONT_PROFILES: Dict[str, List[str]] = {
+    'ja':    ['cjk_japanese'],
+    'ko':    ['cjk_korean'],
+    'zh':    [],   # resolved per region below
+}
+_ZH_SIMPLIFIED_REGIONS  = {'CN', 'SG', 'MY', 'ID'}
+_ZH_TRADITIONAL_REGIONS = {'TW', 'HK', 'MO'}
+
+
+def _mandatory_font_profiles(locale_lang: str, locale_region: str) -> List[str]:
+    """Return font profile names that are mandatory for the given locale."""
+    lang   = locale_lang.lower()
+    region = locale_region.upper()
+
+    if lang == 'zh':
+        if region in _ZH_SIMPLIFIED_REGIONS:
+            return ['cjk_chinese_simplified']
+        if region in _ZH_TRADITIONAL_REGIONS:
+            return ['cjk_chinese_traditional']
+        return ['cjk_chinese_simplified']   # fallback
+    return _LOCALE_MANDATORY_FONT_PROFILES.get(lang, [])
+
+
+def update_fonts(config: Dict[str, Any], target_os: str,
+                 rng: Optional['FingerprintRng'] = None) -> None:
+    """
+    Updates the fonts for the target OS with per-session realistic variation.
+
+    Windows: 2-tier system — core fonts (always present) + optional software
+    profiles (randomly chosen).  Locale-specific profiles are always forced in
+    so a Japanese locale always has Japanese fonts, etc.
+
+    Mac / Linux: original flat list (pool already large enough).
+
+    ``rng`` must be the session's FingerprintRng so fonts are stable in Mode 2.
+    """
+    from .fingerprints import FingerprintRng as _FRng
+    if rng is None:
+        rng = _FRng()   # fallback: fresh random (Mode 1 behaviour)
+
+    profiles_path = os.path.join(os.path.dirname(__file__), "font_profiles.json")
+
+    if target_os == 'win' and os.path.exists(profiles_path):
+        with open(profiles_path, "rb") as f:
+            font_data = orjson.loads(f.read()).get('win', {})
+
+        core_fonts: List[str] = font_data.get('core', [])
+        profiles: Dict[str, Any] = font_data.get('profiles', {})
+
+        if profiles:
+            # ── Mandatory profiles (locale-driven) ────────────────────────
+            locale_lang   = config.get('locale:language', '')
+            locale_region = config.get('locale:region',   '')
+            mandatory = set(_mandatory_font_profiles(locale_lang, locale_region))
+
+            # ── Optional profiles (random selection) ──────────────────────
+            optional_pool = [p for p in profiles if p not in mandatory]
+            opt_weights   = [profiles[p]['weight'] for p in optional_pool]
+
+            num_optional = rng.choices([0, 1, 2], weights=[20, 50, 30])[0]
+            chosen_optional: List[str] = []
+            remaining_names   = optional_pool[:]
+            remaining_weights = opt_weights[:]
+
+            for _ in range(min(num_optional, len(remaining_names))):
+                total = sum(remaining_weights)
+                if not total:
+                    break
+                r = rng.randint(0, total - 1)
+                acc = 0
+                for i, w in enumerate(remaining_weights):
+                    acc += w
+                    if r < acc:
+                        chosen_optional.append(remaining_names[i])
+                        remaining_names.pop(i)
+                        remaining_weights.pop(i)
+                        break
+
+            # ── Build font list ────────────────────────────────────────────
+            optional_fonts: List[str] = []
+            for name in list(mandatory) + chosen_optional:
+                pool = profiles[name]['fonts']
+                # Mandatory profiles: include all; optional: 60–100 %
+                k = (len(pool) if name in mandatory
+                     else rng.randint(max(1, int(len(pool) * 0.60)), len(pool)))
+                optional_fonts.extend(rng.sample(pool, k))
+
+            fonts: List[str] = list(np.unique(core_fonts + optional_fonts).tolist())
+        else:
+            fonts = core_fonts
+    else:
+        with open(os.path.join(os.path.dirname(__file__), "fonts.json"), "rb") as f:
+            fonts = orjson.loads(f.read())[target_os]
+
+    if 'fonts' in config:
+        config['fonts'] = np.unique(fonts + config['fonts']).tolist()
+    else:
+        config['fonts'] = fonts
+
+
+# en-US voices that are present even on a minimal Windows install.
+# These are always included when the primary locale is English.
+_WIN_EN_US_CORE_VOICES = {
+    "Microsoft David - English (United States)",
+    "Microsoft Zira - English (United States)",
+    "Microsoft David Desktop - English (United States)",
+}
+
+# Per-session voice count distribution for Windows.
+# (min, max, weight) — based on realistic Windows installs.
+_WIN_VOICE_COUNT_DIST = [
+    (3,  5,  15),   # minimal: clean EN-only install
+    (5,  10, 25),   # typical: Win10 EN + 1-2 language packs
+    (10, 20, 30),   # common: Win10/11 with several language packs
+    (20, 35, 20),   # power user: many languages installed
+    (35, 53, 10),   # fully loaded / enterprise / language enthusiast
+]
+
+
+def _sample_win_voice_count() -> int:
+    """Sample a realistic total voice count for Windows."""
+    total_w = sum(w for _, _, w in _WIN_VOICE_COUNT_DIST)
+    r = randint(0, total_w - 1)  # nosec
+    acc = 0
+    for mn, mx, w in _WIN_VOICE_COUNT_DIST:
+        acc += w
+        if r < acc:
+            return randint(mn, mx)  # nosec
+    return randint(5, 15)  # nosec  # fallback
+
+
+def _make_voice_obj(name: str, lang: str, service_type: str, target_os: str,
+                    is_default: bool) -> Dict[str, Any]:
+    """Build a voice config dict from raw parts."""
+    is_local = service_type == 'local'
+    if target_os == 'win':
+        uri = f"urn:moz-tts:sapi:{name}?{lang}"
+    else:  # mac
+        uri = f"urn:moz-tts:osx:{name}?{lang}"
+    return {"name": name, "lang": lang, "voiceUri": uri,
+            "isDefault": is_default, "isLocalService": is_local}
+
+
+def update_voices(config: Dict[str, Any], target_os: str,
+                  rng: Optional['FingerprintRng'] = None) -> None:
+    """
+    Injects realistic speech synthesis voices for the target OS.
+
+    Windows: generates a per-session random subset that mimics a realistic
+    installed-voice distribution (3-53 voices).  Guarantees:
+      • ≥ 2 en-US voices (always, David/Zira preferred)
+      • All voices matching the session's primary locale are included
+      • Default voice is always the first en-US voice
+    Mac: use full pool (unchanged behaviour — variety is already large).
+    """
+    with open(os.path.join(os.path.dirname(__file__), "voices.json"), "rb") as f:
+        raw_voices: List[str] = orjson.loads(f.read()).get(target_os, [])
+
+    if not raw_voices:
+        return
+
+    # Parse every entry in the pool
+    parsed: List[Dict[str, str]] = []
+    for voice_str in raw_voices:
+        parts = voice_str.rsplit(':', 2)
+        if len(parts) == 3:
+            name, lang, svc = parts
+            parsed.append({'name': name, 'lang': lang, 'svc': svc, 'raw': voice_str})
+
+    from .fingerprints import FingerprintRng as _FRng
+    if rng is None:
+        rng = _FRng()
+
+    if target_os != 'win':
+        # Mac / Linux: use full pool as before
+        selected = parsed
+    else:
+        # ── Windows: locale-aware random subset (all randomness via rng) ──
+        locale_lang   = config.get('locale:language', 'en')
+        locale_region = config.get('locale:region', 'US')
+        primary_tag   = f"{locale_lang}-{locale_region}"  # e.g. "de-DE"
+
+        en_us_voices     = [v for v in parsed if v['lang'] == 'en-US']
+        primary_voices   = (
+            [v for v in parsed if v['lang'] == primary_tag]
+            if not primary_tag.startswith('en') else []
+        )
+        remaining_voices = [v for v in parsed
+                            if v not in en_us_voices and v not in primary_voices]
+
+        target_count = rng.choices(
+            [rng.randint(mn, mx) for mn, mx, _ in _WIN_VOICE_COUNT_DIST],
+            weights=[w for _, _, w in _WIN_VOICE_COUNT_DIST],
+            k=1,
+        )[0]
+
+        # Always include ≥ 2 en-US voices; prefer the "core" set
+        min_en_us   = rng.randint(2, min(3, len(en_us_voices)))
+        core_en_us  = [v for v in en_us_voices if v['name'] in _WIN_EN_US_CORE_VOICES]
+        extra_en_us = [v for v in en_us_voices if v['name'] not in _WIN_EN_US_CORE_VOICES]
+
+        selected_en_us = core_en_us[:min_en_us]
+        needed = min_en_us - len(selected_en_us)
+        if needed > 0 and extra_en_us:
+            selected_en_us += extra_en_us[:needed]
+
+        # Always include ALL voices for the session's primary locale
+        selected_primary = list(primary_voices)
+
+        # Fill remaining slots from the rest of the pool
+        already = {v['name'] for v in selected_en_us + selected_primary}
+        pool    = [v for v in remaining_voices if v['name'] not in already]
+        slots   = max(0, target_count - len(selected_en_us) - len(selected_primary))
+        selected_others = rng.sample(pool, min(slots, len(pool))) if slots and pool else []
+
+        # en-US first so the default voice is always a recognisable en-US name
+        selected = selected_en_us + selected_primary + selected_others
+
+    # Convert to voice config objects
+    voices: List[Dict[str, Any]] = []
+    first_en_seen = False
+    for v in selected:
+        is_default = False
+        if not first_en_seen and v['lang'].startswith('en'):
+            is_default = True
+            first_en_seen = True
+        voices.append(_make_voice_obj(v['name'], v['lang'], v['svc'], target_os, is_default))
+
+    if voices:
+        config['voices'] = voices
+        config['voices:blockIfNotDefined'] = True
+        config['voices:fakeCompletion'] = True
+
+
+# Timezone pools by locale region — used when no explicit timezone is configured
+_LOCALE_TIMEZONE_MAP: Dict[str, List[str]] = {
+    'US': ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+           'America/Phoenix', 'America/Detroit', 'America/Indiana/Indianapolis'],
+    'GB': ['Europe/London'],
+    'CA': ['America/Toronto', 'America/Vancouver', 'America/Edmonton', 'America/Winnipeg'],
+    'AU': ['Australia/Sydney', 'Australia/Melbourne', 'Australia/Brisbane', 'Australia/Perth'],
+    'DE': ['Europe/Berlin'],
+    'FR': ['Europe/Paris'],
+    'NL': ['Europe/Amsterdam'],
+    'IT': ['Europe/Rome'],
+    'ES': ['Europe/Madrid'],
+    'PL': ['Europe/Warsaw'],
+    'RU': ['Europe/Moscow', 'Asia/Yekaterinburg', 'Asia/Novosibirsk'],
+    'BR': ['America/Sao_Paulo', 'America/Manaus', 'America/Fortaleza'],
+    'IN': ['Asia/Kolkata'],
+    'CN': ['Asia/Shanghai'],
+    'JP': ['Asia/Tokyo'],
+    'KR': ['Asia/Seoul'],
+    'SG': ['Asia/Singapore'],
+    'TR': ['Europe/Istanbul'],
+    'MX': ['America/Mexico_City', 'America/Monterrey', 'America/Tijuana'],
+    'AR': ['America/Argentina/Buenos_Aires'],
+    'ZA': ['Africa/Johannesburg'],
+    'NG': ['Africa/Lagos'],
+    'EG': ['Africa/Cairo'],
+    'SA': ['Asia/Riyadh'],
+    'AE': ['Asia/Dubai'],
+    'IL': ['Asia/Jerusalem'],
+    'PH': ['Asia/Manila'],
+    'ID': ['Asia/Jakarta', 'Asia/Makassar'],
+    'TH': ['Asia/Bangkok'],
+    'VN': ['Asia/Ho_Chi_Minh'],
+    'UA': ['Europe/Kyiv'],
+    'SE': ['Europe/Stockholm'],
+    'NO': ['Europe/Oslo'],
+    'FI': ['Europe/Helsinki'],
+    'DK': ['Europe/Copenhagen'],
+    'CH': ['Europe/Zurich'],
+    'AT': ['Europe/Vienna'],
+    'BE': ['Europe/Brussels'],
+    'PT': ['Europe/Lisbon'],
+    'HU': ['Europe/Budapest'],
+    'RO': ['Europe/Bucharest'],
+    'CZ': ['Europe/Prague'],
+    'GR': ['Europe/Athens'],
+}
+_DEFAULT_TIMEZONE_POOL = ['America/New_York', 'America/Chicago', 'America/Los_Angeles',
+                           'Europe/London', 'Europe/Paris', 'Europe/Berlin',
+                           'Asia/Tokyo', 'Asia/Shanghai', 'Australia/Sydney']
+
+
+def get_default_timezone(config: Dict[str, Any], nav_lang_hint: str = '',
+                         rng: Optional['FingerprintRng'] = None) -> str:
+    """
+    Returns a plausible default timezone based on the locale/region in the config.
+    Priority: explicit locale:region > navigator.language region suffix > random pool.
+    This ensures e.g. en-US fingerprints get American timezones, not Asian ones.
+
+    nav_lang_hint: pass fingerprint.navigator.language directly since browserforge.yml
+    intentionally doesn't map navigator.language to the config dict.
+    """
+    from .fingerprints import FingerprintRng as _FRng
+    _pick = (rng or _FRng()).choice
+
+    # 1. Explicit locale:region key (set by user or handle_locales)
+    region = config.get('locale:region', '')
+    if region and region.upper() in _LOCALE_TIMEZONE_MAP:
+        return _pick(_LOCALE_TIMEZONE_MAP[region.upper()])
+
+    # 2. Extract region from navigator.language in config (if somehow present)
+    nav_lang = config.get('navigator.language', '') or nav_lang_hint
+    if nav_lang and '-' in nav_lang:
+        lang_region = nav_lang.split('-')[-1].upper()
+        if lang_region in _LOCALE_TIMEZONE_MAP:
+            return _pick(_LOCALE_TIMEZONE_MAP[lang_region])
+
+    return _pick(_DEFAULT_TIMEZONE_POOL)
+
+
+def check_custom_fingerprint(fingerprint: Fingerprint) -> None:
+    """
+    Asserts that the passed BrowserForge fingerprint is a valid Firefox fingerprint.
+    and warns the user that passing their own fingerprint is not recommended.
+    """
+    # Check what the browser is
+    browser_name = user_agent_parser.ParseUserAgent(fingerprint.navigator.userAgent).get(
+        'family', 'Non-Firefox'
+    )
+    if browser_name != 'Firefox':
+        raise NonFirefoxFingerprint(
+            f'"{browser_name}" fingerprints are not supported in Foxyz. '
+            'Using fingerprints from a browser other than Firefox WILL lead to detection. '
+            'If this is intentional, pass `i_know_what_im_doing=True`.'
+        )
+
+    LeakWarning.warn('custom_fingerprint', False)
+
+
+def check_valid_os(os: ListOrString) -> None:
+    """
+    Checks if the target OS is valid.
+    """
+    if not isinstance(os, str):
+        for os_name in os:
+            check_valid_os(os_name)
+        return
+    # Assert that the OS is lowercase
+    if not os.islower():
+        raise InvalidOS(f"OS values must be lowercase: '{os}'")
+    # Assert that the OS is supported by Foxyz
+    if os not in ('windows', 'macos'):
+        raise InvalidOS(f"Foxyz does not support the OS: '{os}'")
+
+
+def _clean_locals(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Gets the launch options from the locals of the function.
+    """
+    del data['playwright']
+    del data['persistent_context']
+    return data
+
+
+def merge_into(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    """
+    Merges new keys/values from the source dictionary into the target dictionary.
+    Given that the key does not exist in the target dictionary.
+    """
+    for key, value in source.items():
+        if key not in target:
+            target[key] = value
+
+
+def set_into(target: Dict[str, Any], key: str, value: Any) -> None:
+    """
+    Sets a new key/value into the target dictionary.
+    Given that the key does not exist in the target dictionary.
+    """
+    if key not in target:
+        target[key] = value
+
+
+def is_domain_set(
+    config: Dict[str, Any],
+    *properties: str,
+) -> bool:
+    """
+    Checks if a domain is set in the config.
+    """
+    for prop in properties:
+        # If the . prefix exists, check if the domain is a prefix of any key in the config
+        if prop[-1] in ('.', ':'):
+            if any(key.startswith(prop) for key in config):
+                return True
+        # Otherwise, check if the domain is a direct key in the config
+        else:
+            if prop in config:
+                return True
+    return False
+
+
+def warn_manual_config(config: Dict[str, Any]) -> None:
+    """
+    Warns the user if they are manually setting properties that Foxyz already sets internally.
+    """
+    # Manual locale setting
+    if is_domain_set(
+        config, 'navigator.language', 'navigator.languages', 'headers.Accept-Language', 'locale:'
+    ):
+        LeakWarning.warn('locale', False)
+    # Manual geolocation and timezone setting
+    if is_domain_set(config, 'geolocation:', 'timezone'):
+        LeakWarning.warn('geolocation', False)
+    # Manual User-Agent setting
+    if is_domain_set(config, 'headers.User-Agent'):
+        LeakWarning.warn('header-ua', False)
+    # Manual navigator setting
+    if is_domain_set(config, 'navigator.'):
+        LeakWarning.warn('navigator', False)
+    # Manual screen/window setting
+    if is_domain_set(config, 'screen.', 'window.', 'document.body.'):
+        LeakWarning.warn('viewport', False)
+
+
+async def async_attach_vd(
+    browser: Any, virtual_display: Optional[VirtualDisplay] = None
+) -> Any:  # type: ignore
+    """
+    Attaches the virtual display to the async browser cleanup
+    """
+    if not virtual_display:  # Skip if no virtual display is provided
+        return browser
+
+    _close = browser.close
+
+    async def new_close(*args: Any, **kwargs: Any):
+        await _close(*args, **kwargs)
+        if virtual_display:
+            virtual_display.kill()
+
+    browser.close = new_close
+    browser._virtual_display = virtual_display
+
+    return browser
+
+
+def sync_attach_vd(
+    browser: Any, virtual_display: Optional[VirtualDisplay] = None
+) -> Any:  # type: ignore
+    """
+    Attaches the virtual display to the sync browser cleanup
+    """
+    if not virtual_display:  # Skip if no virtual display is provided
+        return browser
+
+    _close = browser.close
+
+    def new_close(*args: Any, **kwargs: Any):
+        _close(*args, **kwargs)
+        if virtual_display:
+            virtual_display.kill()
+
+    browser.close = new_close
+    browser._virtual_display = virtual_display
+
+    return browser
+
+
+def launch_options(
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    os: Optional[ListOrString] = None,
+    block_images: Optional[bool] = None,
+    block_webrtc: Optional[bool] = None,
+    block_webgl: Optional[bool] = None,
+    disable_coop: Optional[bool] = None,
+    webgl_config: Optional[Tuple[str, str]] = None,
+    geoip: Optional[Union[str, bool]] = True,
+    humanize: Optional[Union[bool, float]] = None,
+    locale: Optional[Union[str, List[str]]] = None,
+    addons: Optional[List[str]] = None,
+    fonts: Optional[List[str]] = None,
+    custom_fonts_only: Optional[bool] = None,
+    exclude_addons: Optional[List[DefaultAddons]] = None,
+    screen: Optional[Screen] = None,
+    window: Optional[Tuple[int, int]] = None,
+    fingerprint: Optional[Fingerprint] = None,
+    ff_version: Optional[int] = None,
+    headless: Optional[bool] = None,
+    main_world_eval: Optional[bool] = None,
+    executable_path: Optional[Union[str, Path]] = None,
+    firefox_user_prefs: Optional[Dict[str, Any]] = None,
+    proxy: Optional[Dict[str, str]] = None,
+    enable_cache: Optional[bool] = None,
+    args: Optional[List[str]] = None,
+    env: Optional[Dict[str, Union[str, float, bool]]] = None,
+    i_know_what_im_doing: Optional[bool] = None,
+    debug: Optional[bool] = None,
+    virtual_display: Optional[str] = None,
+    profile_seed: Optional[int] = None,
+    allow_addon_new_tab: Optional[bool] = None,
+    **launch_options: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Launches a new browser instance for Foxyz.
+    Accepts all Playwright Firefox launch options, along with the following:
+
+    Parameters:
+        config (Optional[Dict[str, Any]]):
+            Foxyz properties to use.
+        os (Optional[ListOrString]):
+            Operating system to use for the fingerprint generation.
+            Can be "windows", "macos", "linux", or a list to randomly choose from.
+            Default: randomly chosen from ["windows", "macos", "linux"]
+        block_images (Optional[bool]):
+            Whether to block all images.
+        block_webrtc (Optional[bool]):
+            Whether to block WebRTC entirely.
+        block_webgl (Optional[bool]):
+            Whether to block WebGL. To prevent leaks, only use this for special cases.
+        disable_coop (Optional[bool]):
+            Disables the Cross-Origin-Opener-Policy, allowing elements in cross-origin iframes,
+            such as the Turnstile checkbox, to be clicked.
+        geoip (Optional[Union[str, bool]]):
+            Calculate longitude, latitude, timezone, country, & locale based on the IP address.
+            Pass the target IP address to use, or `True` to find the IP address automatically.
+        humanize (Optional[Union[bool, float]]):
+            Humanize the cursor movement.
+            Takes either `True`, or the MAX duration in seconds of the cursor movement.
+        locale (Optional[Union[str, List[str]]]):
+            Locale(s) to use in Foxyz. The first listed locale will be used for the Intl API.
+        addons (Optional[List[str]]):
+            List of Firefox addons to use.
+        fonts (Optional[List[str]]):
+            Fonts to load into Foxyz (in addition to the default fonts for the target `os`).
+            Takes a list of font family names that are installed on the system.
+        custom_fonts_only (Optional[bool]):
+            If enabled, OS-specific system fonts will not be passed to Foxyz.
+        exclude_addons (Optional[List[DefaultAddons]]):
+            Default addons to exclude. Passed as a list of foxyz.DefaultAddons enums.
+        screen (Optional[Screen]):
+            Constrains the screen dimensions of the generated fingerprint.
+        window (Optional[Tuple[int, int]]):
+            Set a fixed window size instead of generating a random one.
+        fingerprint (Optional[Fingerprint]):
+            Use a custom BrowserForge fingerprint.
+        ff_version (Optional[int]):
+            Firefox version to use. Defaults to the current Foxyz version.
+        headless (Optional[bool]):
+            Whether to run the browser in headless mode. Defaults to False.
+        main_world_eval (Optional[bool]):
+            Whether to enable running scripts in the main world.
+        executable_path (Optional[Union[str, Path]]):
+            Custom Foxyz browser executable path.
+        firefox_user_prefs (Optional[Dict[str, Any]]):
+            Firefox user preferences to set.
+        proxy (Optional[Dict[str, str]]):
+            Proxy to use for the browser.
+        enable_cache (Optional[bool]):
+            Cache previous pages, requests, etc (uses more memory).
+        args (Optional[List[str]]):
+            Arguments to pass to the browser.
+        env (Optional[Dict[str, Union[str, float, bool]]]):
+            Environment variables to set.
+        debug (Optional[bool]):
+            Prints the config being sent to Foxyz.
+        virtual_display (Optional[str]):
+            Virtual display number. Ex: ':99'.
+        webgl_config (Optional[Tuple[str, str]]):
+            Use a specific WebGL vendor/renderer pair. Passed as a tuple of (vendor, renderer).
+        allow_addon_new_tab (Optional[bool]):
+            Whether to allow extensions to open new tabs. Defaults to False.
+        **launch_options (Dict[str, Any]):
+            Additional Firefox launch options.
+    """
+    # Build the config
+    if config is None:
+        config = {}
+
+    # Set default values for optional arguments
+    if headless is None:
+        headless = False
+    if addons is None:
+        addons = []
+    if args is None:
+        args = []
+    if firefox_user_prefs is None:
+        firefox_user_prefs = {}
+    if custom_fonts_only is None:
+        custom_fonts_only = False
+    if i_know_what_im_doing is None:
+        i_know_what_im_doing = False
+    if env is None:
+        env = cast(Dict[str, Union[str, float, bool]], environ)
+    if isinstance(executable_path, str):
+        # Convert executable path to a Path object
+        executable_path = Path(abspath(executable_path))
+
+    # Handle virtual display
+    if virtual_display:
+        env['DISPLAY'] = virtual_display
+
+    # Warn the user for manual config settings
+    if not i_know_what_im_doing:
+        warn_manual_config(config)
+
+    # Assert the target OS is valid
+    if os:
+        check_valid_os(os)
+
+    # webgl_config requires OS to be set
+    elif webgl_config:
+        raise ValueError('OS must be set when using webgl_config')
+
+    # Add the default addons
+    add_default_addons(addons, exclude_addons)
+
+    # Confirm all addon paths are valid
+    if addons:
+        confirm_paths(addons)
+        config['addons'] = addons
+
+    # Get the Firefox version
+    if ff_version:
+        ff_version_str = str(ff_version)
+        LeakWarning.warn('ff_version', i_know_what_im_doing)
+    else:
+        ff_version_str = installed_verstr().split('.', 1)[0]
+
+    # ── Session RNG ──────────────────────────────────────────────────────────
+    # Mode 1 (profile_seed=None): fresh seed every launch → unique identity.
+    # Mode 2 (profile_seed=<int>): fixed seed → identical fingerprint every launch.
+    # ALL fingerprint randomness (screen tier, fonts, voices, seeds…) flows
+    # through this single RNG so the entire identity is reproducible from one int.
+    rng = FingerprintRng(profile_seed)
+
+    # Generate a fingerprint
+    if fingerprint is None:
+        # Pass user-supplied screen constraint only; the device-tier system inside
+        # generate_fingerprint() selects a coherent (screen, DPR, cores) bundle.
+        # get_screen_cons() was previously used to constrain headless sessions to
+        # the physical monitor, but is no longer needed now that the tier system
+        # always picks realistic resolutions that fit any modern display.
+        fingerprint = generate_fingerprint(
+            screen=screen,   # None unless user explicitly passed screen=
+            window=window,
+            os=os,
+            rng=rng,
+        )
+    else:
+        # Or use the one passed by the user
+        if not i_know_what_im_doing:
+            check_custom_fingerprint(fingerprint)
+
+    # Inject the fingerprint into the config
+    merge_into(
+        config,
+        from_browserforge(fingerprint, ff_version_str),
+    )
+
+    # Propagate DPR from screen — browserforge.yml intentionally omits this to
+    # avoid the 1.0-only assumption, but our device-tier system assigns DPR
+    # values that are genuinely realistic (1.25 for scaled_hd, 1.5/2.0 for 4K).
+    sc_dpr = getattr(fingerprint.screen, 'devicePixelRatio', None)
+    if sc_dpr and sc_dpr != 1.0:
+        set_into(config, 'window.devicePixelRatio', float(sc_dpr))
+
+    # Set a realistic navigator.buildID derived from the Firefox version.
+    # Camoufox's default "20181001000000" is a well-known antidetect signature —
+    # replace it with a version-consistent timestamp so scanners can't flag it.
+    try:
+        major_v = int(ff_version_str.split('.')[0])
+    except (ValueError, AttributeError):
+        major_v = 130
+    set_into(config, 'navigator.buildID', _generate_build_id(major_v, rng))
+
+    target_os = get_target_os(config)
+
+    # Set a random window.history.length
+    set_into(config, 'window.history.length', rng.randrange(1, 6))
+
+    # Set geolocation
+    # geoip=True (default): auto-resolve IP → MaxMind city-level timezone.
+    # This ensures timezone always matches the apparent IP location:
+    #   - No proxy  → local public IP timezone
+    #   - Proxy     → proxy IP timezone (looked up through the proxy)
+    #   - US proxy  → exact city/state timezone (e.g. America/Chicago for Dallas TX)
+    # Falls back to locale-based timezone if IP lookup or DB lookup fails.
+    if geoip:
+        try:
+            geoip_allowed()  # Assert that geoip module + DB are available
+
+            if geoip is True:
+                # Resolve apparent public IP (via proxy if configured)
+                if proxy:
+                    geoip = public_ip(Proxy(**proxy).as_string())
+                else:
+                    geoip = public_ip()
+
+            # Spoof WebRTC to match geoip IP
+            if not block_webrtc:
+                if valid_ipv4(geoip):
+                    set_into(config, 'webrtc:ipv4', geoip)
+                    firefox_user_prefs['network.dns.disableIPv6'] = True
+                    # Prevent WebRTC from exposing IPv6 addresses via ICE candidates
+                    firefox_user_prefs['media.peerconnection.ice.default_address_only'] = True
+                    firefox_user_prefs['media.peerconnection.ice.no_host'] = True
+                    # When using proxy, force ICE candidates through proxy to prevent
+                    # STUN from revealing real IP address
+                    if proxy:
+                        firefox_user_prefs['media.peerconnection.ice.proxy_only_if_behind_proxy'] = True
+                        firefox_user_prefs['media.peerconnection.ice.relay_only'] = True
+                elif valid_ipv6(geoip):
+                    set_into(config, 'webrtc:ipv6', geoip)
+
+            geolocation = get_geolocation(geoip)
+            config.update(geolocation.as_config())
+
+        except Exception:
+            # Fallback: geoip unavailable (network error, missing DB, unknown IP).
+            # Timezone will be set from locale pool below — not ideal but prevents crash.
+            pass
+
+    # When a proxy is configured, always prevent WebRTC from revealing the real IP
+    # via STUN, even if geoip is disabled. These prefs force ICE candidates through
+    # the proxy tunnel.
+    if proxy and not block_webrtc:
+        firefox_user_prefs['media.peerconnection.ice.default_address_only'] = True
+        firefox_user_prefs['media.peerconnection.ice.no_host'] = True
+        firefox_user_prefs['media.peerconnection.ice.proxy_only_if_behind_proxy'] = True
+        firefox_user_prefs['media.peerconnection.ice.relay_only'] = True
+
+    # Warn when proxy is used but geoip resolution failed/skipped (timezone mismatch risk).
+    if (
+        proxy
+        and 'localhost' not in proxy.get('server', '')
+        and not is_domain_set(config, 'geolocation:')
+    ):
+        LeakWarning.warn('proxy_without_geoip')
+
+    # If no timezone was configured (via geoip or explicit config), set a default
+    # based on the fingerprint's locale — prevents real host timezone from leaking.
+    # Pass navigator.language from the fingerprint directly (it's intentionally
+    # not mapped in browserforge.yml to avoid leaking locale as a signal, but we
+    # need it here for timezone consistency).
+    if not config.get('timezone'):
+        fp_nav_lang = getattr(getattr(fingerprint, 'navigator', None), 'language', '') or ''
+        set_into(config, 'timezone', get_default_timezone(config, fp_nav_lang, rng=rng))
+
+    # Set locale
+    if locale:
+        handle_locales(locale, config, rng=rng)
+    elif not is_domain_set(config, 'locale:'):
+        fp_nav_lang = getattr(getattr(fingerprint, 'navigator', None), 'language', '') or ''
+        if fp_nav_lang and len(fp_nav_lang) > 2:
+            try:
+                handle_locales(fp_nav_lang, config, rng=rng)
+            except Exception:
+                pass
+
+    # Update fonts — done AFTER locale is resolved so that locale-mandatory profiles
+    # (e.g. cjk_japanese for ja-JP locale) are correctly detected and included.
+    if fonts:
+        config['fonts'] = fonts
+
+    if custom_fonts_only:
+        firefox_user_prefs['gfx.bundled-fonts.activate'] = 0
+        if fonts:
+            LeakWarning.warn('custom_fonts_only')
+        else:
+            raise ValueError('No custom fonts were passed, but `custom_fonts_only` is enabled.')
+    else:
+        # Ensure bundled fonts are activated (defence-in-depth: camoufox.cfg also
+        # sets this, but being explicit here guarantees it even on custom builds
+        # or when camoufox.cfg sync is skipped).
+        firefox_user_prefs['gfx.bundled-fonts.activate'] = 1
+        update_fonts(config, target_os, rng=rng)
+        # Auto-inject cross-OS fonts on first launch if the installation was
+        # downloaded without them (e.g. upstream camoufox binary).
+        _ensure_bundled_fonts()
+
+    # Font spacing seed — derived from session RNG for Mode 2 stability
+    set_into(config, 'fonts:spacing_seed', rng.randint(0, 1_073_741_823))
+
+    # Inject realistic speech synthesis voices — done AFTER locale is resolved so
+    # update_voices() knows the primary locale and can guarantee those voices are included.
+    update_voices(config, target_os, rng=rng)
+
+    # Pass the humanize option
+    if humanize:
+        set_into(config, 'humanize', True)
+        if isinstance(humanize, (int, float)):
+            set_into(config, 'humanize:maxTime', humanize)
+
+    # Enable the main world context creation
+    if main_world_eval:
+        set_into(config, 'allowMainWorld', True)
+
+    # Allow extensions to open new tabs
+    if allow_addon_new_tab:
+        set_into(config, 'allowAddonNewtab', True)
+
+    # Set Firefox user preferences
+    if block_images:
+        LeakWarning.warn('block_images', i_know_what_im_doing)
+        firefox_user_prefs['permissions.default.image'] = 2
+    if block_webrtc:
+        firefox_user_prefs['media.peerconnection.enabled'] = False
+    if disable_coop:
+        LeakWarning.warn('disable_coop', i_know_what_im_doing)
+        firefox_user_prefs['browser.tabs.remote.useCrossOriginOpenerPolicy'] = False
+
+    # Allow allow_webgl parameter for backwards compatibility
+    if block_webgl or launch_options.pop('allow_webgl', True) is False:
+        firefox_user_prefs['webgl.disabled'] = True
+        LeakWarning.warn('block_webgl', i_know_what_im_doing)
+    else:
+        # If the user has provided a specific WebGL vendor/renderer pair, use it
+        if webgl_config:
+            webgl_fp = sample_webgl(target_os, *webgl_config)
+        else:
+            webgl_fp = sample_webgl(target_os)
+        enable_webgl2 = webgl_fp.pop('webGl2Enabled')
+
+        # Merge the WebGL fingerprint into the config
+        merge_into(config, webgl_fp)
+        # Set the WebGL preferences
+        merge_into(
+            firefox_user_prefs,
+            {
+                'webgl.enable-webgl2': enable_webgl2,
+                'webgl.force-enabled': True,
+                # Required for WebGL2 on macOS where GPU acceleration may be
+                # partially blocked: don't fail if performance caveats are detected
+                'webgl.disable-fail-if-major-performance-caveat': True,
+            },
+        )
+
+    # Canvas anti-fingerprinting — use session RNG so Mode 2 profiles are stable
+    merge_into(
+        config,
+        {
+            'canvas:aaOffset': rng.randint(-50, 50),
+            'canvas:aaCapOffset': True,
+        },
+    )
+    # Per-session canvas / audio seeds — all derived from the session RNG
+    # so they are stable across launches in Mode 2 (profile_seed provided).
+    # NOTE: webGl:noiseSeed intentionally NOT set — WebGL readPixels must return clean data
+    # so the red box hash check on pixelscan matches the expected SHA-256 value.
+    # Canvas 2D noise (canvas:seed) is kept for testCanvas2d=true check.
+    set_into(config, 'canvas:seed',    rng.randint(1, 1_073_741_823))
+    set_into(config, 'audio:seed',     rng.randint(1, 1_073_741_823))
+
+    # Cache previous pages, requests, etc (uses more memory)
+    if enable_cache:
+        merge_into(firefox_user_prefs, CACHE_PREFS)
+
+    # Print the config if debug is enabled
+    if debug:
+        print('[DEBUG] Config:')
+        pprint(config)
+
+    # Validate the config
+    validate_config(config, path=executable_path)
+
+    # Prepare environment variables to pass to Foxyz
+    env_vars = {
+        **get_env_vars(config, target_os),
+        **env,
+    }
+    # Prepare the executable path
+    if executable_path:
+        executable_path = str(executable_path)
+    else:
+        executable_path = launch_path()
+
+    return {
+        "executable_path": executable_path,
+        "args": args,
+        "env": env_vars,
+        "firefox_user_prefs": firefox_user_prefs,
+        "proxy": proxy,
+        "headless": headless,
+        **(launch_options if launch_options is not None else {}),
+    }

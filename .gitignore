@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# Debug & test artifacts
+debug_*.json
+debug_*.png
+screenshot_*.png
+test_*.py
+test_*.json

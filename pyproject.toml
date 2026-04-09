@@ -1,0 +1,54 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "foxyz"
+version = "1.0.5"
+description = "Wrapper around Playwright to help launch Foxyz"
+authors = ["AntifoxyzDev"]
+license = "MIT"
+repository = "https://github.com/foxyzcoding/foxyz"
+readme = "README.md"
+keywords = [
+    "client",
+    "fingerprint",
+    "browser",
+    "scraping",
+    "injector",
+    "firefox",
+    "playwright",
+]
+classifiers = [
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+rich-click = "*"
+rich = "*"
+requests = "*"
+orjson = "*"
+browserforge = "^1.2.4"
+playwright = "*"
+pyyaml = "*"
+platformdirs = "*"
+numpy = "*"
+ua_parser = "*"
+typing_extensions = "*"
+screeninfo = "*"
+lxml = "*"
+language-tags = "*"
+pysocks = "*"
+inquirer = "*"
+geoip2 = {version = "*", optional = true}
+PySide6 = {version = "*", optional = true}
+
+[tool.poetry.extras]
+geoip = ["geoip2"]
+gui = ["PySide6"]
+
+[tool.poetry.scripts]
+foxyz = "foxyz.__main__:cli"
