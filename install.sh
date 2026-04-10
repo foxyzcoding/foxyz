@@ -63,10 +63,21 @@ if [ -n "$SHELL_PROFILE" ]; then
     fi
 fi
 
+# 7. Download run.py to home directory
+echo "Downloading run.py..."
+curl -fsSL "https://raw.githubusercontent.com/foxyzcoding/foxyz/main/run.py" -o "$HOME/foxyz-run.py"
+
 echo ""
-echo "Done! Foxyz is ready to use."
+echo "======================================"
+echo "  Foxyz installed successfully!"
+echo "======================================"
+echo ""
+echo "Để mở browser, chạy lệnh:"
+echo ""
+echo "  ~/.foxyz-env/bin/python3 ~/foxyz-run.py"
+echo ""
 if [ -n "$SHELL_PROFILE" ]; then
-    echo ""
-    echo "Apply PATH changes:"
+    echo "Hoặc source profile trước để dùng lệnh ngắn hơn:"
     echo "  source $SHELL_PROFILE"
+    echo "  python3 ~/foxyz-run.py"
 fi
