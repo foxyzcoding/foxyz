@@ -30,7 +30,7 @@ echo "Setting up virtual environment..."
 rm -rf "$VENV_DIR"
 $PYTHON -m venv "$VENV_DIR"
 
-# 3. Install foxyz using venv's own pip — isolated from system, no PEP 668 conflict
+# 3. Install foxyz using venv's own pip
 echo "Installing foxyz..."
 "$VENV_DIR/bin/pip" install foxyz
 
@@ -38,12 +38,18 @@ echo "Installing foxyz..."
 echo "Downloading browser..."
 "$VENV_DIR/bin/foxyz" fetch
 
-# 5. Remove macOS quarantine
+# 5. Remove macOS quarantine — cover all possible app bundle names
+echo "Removing macOS quarantine..."
 FOXYZ_CACHE="$HOME/Library/Caches/foxyz"
-if [ -d "$FOXYZ_CACHE" ]; then
-    echo "Removing macOS quarantine..."
-    xattr -dr com.apple.quarantine "$FOXYZ_CACHE" 2>/dev/null || true
-fi
+xattr -dr com.apple.quarantine "$FOXYZ_CACHE" 2>/dev/null || true
+# Also handle individual app bundles explicitly
+for APP in "$FOXYZ_CACHE/browsers/official/"*/Foxyz.app "$FOXYZ_CACHE/browsers/official/"*/Camoufox.app; do
+    if [ -e "$APP" ]; then
+        xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+        # Remove from macOS Gatekeeper assessment cache
+        spctl --add "$APP" 2>/dev/null || true
+    fi
+done
 
 # 6. Add to PATH in shell profile
 SHELL_PROFILE=""
@@ -63,7 +69,7 @@ if [ -n "$SHELL_PROFILE" ]; then
     fi
 fi
 
-# 7. Download run.py to home directory
+# 7. Download run.py
 echo "Downloading run.py..."
 curl -fsSL "https://raw.githubusercontent.com/foxyzcoding/foxyz/main/run.py" -o "$HOME/foxyz-run.py"
 
@@ -76,8 +82,3 @@ echo "Để mở browser, chạy lệnh:"
 echo ""
 echo "  ~/.foxyz-env/bin/python3 ~/foxyz-run.py"
 echo ""
-if [ -n "$SHELL_PROFILE" ]; then
-    echo "Hoặc source profile trước để dùng lệnh ngắn hơn:"
-    echo "  source $SHELL_PROFILE"
-    echo "  python3 ~/foxyz-run.py"
-fi

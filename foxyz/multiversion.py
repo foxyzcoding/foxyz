@@ -481,6 +481,7 @@ def _rebrand_mac_app(install_path: Path) -> None:
 
     # Replace icon with Foxyz logo if available
     logo_candidates = [
+        Path(__file__).parent / 'gui' / 'assets' / 'browserlogo.png',  # bundled in package
         Path(__file__).parent.parent.parent.parent / 'browserlogo.png',  # repo root
         Path.home() / 'Desktop' / 'Foxyz' / 'browserlogo.png',
     ]
