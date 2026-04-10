@@ -8,6 +8,28 @@
 
 ---
 
+## Installation
+
+**macOS / Linux — paste vào Terminal:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/foxyzcoding/foxyz/main/install.sh | bash
+```
+
+Script tự động:
+- Cài Python 3 nếu chưa có
+- Cài `foxyz` library
+- Download browser binary
+
+**Hoặc cài thủ công:**
+
+```bash
+python3 -m pip install foxyz
+python3 -m foxyz fetch
+```
+
+---
+
 ## Features
 
 - Unique, consistent browser fingerprints across every session
@@ -17,15 +39,6 @@
 - Geolocation, timezone, and locale matching for proxy environments
 - Headful and headless modes
 - Async and sync API
-
----
-
-## Installation
-
-```bash
-pip install foxyz
-foxyz fetch
-```
 
 ---
 
@@ -58,11 +71,10 @@ with NewBrowser(headless=False, from_options=opts) as browser:
 ## CLI
 
 ```bash
-foxyz fetch          # Download the browser
-foxyz fetch --help   # See all options
-foxyz list           # List installed versions
-foxyz remove         # Remove all data
-foxyz version        # Show version info
+python3 -m foxyz fetch      # Download the browser
+python3 -m foxyz list       # List installed versions
+python3 -m foxyz remove     # Remove all data
+python3 -m foxyz version    # Show version info
 ```
 
 ---
