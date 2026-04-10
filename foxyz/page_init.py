@@ -3,6 +3,72 @@ Foxyz page init scripts - injected into every page to fix fingerprint consistenc
 These scripts ensure pixelscan.net and similar fingerprint checkers see consistent data.
 """
 
+# ============================================================================
+# STEALTH_SCRIPT — Must run FIRST before all other init scripts.
+# Provides a central toString spoofing registry so overridden native functions
+# still return "[native code]" when inspected via Function.prototype.toString.
+# This prevents pixelscan's jsModifyDetected check from flagging our overrides.
+# ============================================================================
+STEALTH_SCRIPT = """(function() {
+    var _nativeToString = Function.prototype.toString;
+    var _spoofMap = new Map();
+
+    Object.defineProperty(window, '__foxyz_spoof', {
+        value: function(fn, original) {
+            _spoofMap.set(fn, _nativeToString.call(original));
+            // Copy name and length to match native function signature
+            try { Object.defineProperty(fn, 'name', {value: original.name, configurable: true}); } catch(e) {}
+            try { Object.defineProperty(fn, 'length', {value: original.length, configurable: true}); } catch(e) {}
+        },
+        configurable: true,
+        enumerable: false,
+        writable: false
+    });
+
+    Function.prototype.toString = function() {
+        if (_spoofMap.has(this)) return _spoofMap.get(this);
+        return _nativeToString.call(this);
+    };
+    _spoofMap.set(Function.prototype.toString, _nativeToString.call(_nativeToString));
+})();"""
+
+# ============================================================================
+# WEBGL_RENDERER_CLEAN_SCRIPT — Strip ", or similar" suffix from WebGL renderer
+# at the JS level. Camoufox's SanitizeRenderer.cpp appends this for privacy,
+# but pixelscan reads it client-side via getParameter(UNMASKED_RENDERER_WEBGL)
+# and flags it as masking. This override removes the suffix transparently.
+# ============================================================================
+WEBGL_RENDERER_CLEAN_SCRIPT = """(function() {
+    var RENDERER = 0x9246;
+
+    function cleanRenderer(value) {
+        if (typeof value === 'string') {
+            return value.replace(/, or similar$/i, '');
+        }
+        return value;
+    }
+
+    function patchGetParameter(orig) {
+        var patched = function getParameter(pname) {
+            var result = orig.call(this, pname);
+            if (pname === RENDERER) {
+                return cleanRenderer(result);
+            }
+            return result;
+        };
+        if (window.__foxyz_spoof) window.__foxyz_spoof(patched, orig);
+        return patched;
+    }
+
+    var origGetParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = patchGetParameter(origGetParam);
+
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        var origGetParam2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = patchGetParameter(origGetParam2);
+    }
+})();"""
+
 # MD5 implementation for fptc.min.js (pixelscan's fingerprint collector requires window.MD5)
 MD5_SCRIPT = """(function() {
     if (typeof window.MD5 !== 'undefined') return;
@@ -68,6 +134,7 @@ WEBKIT_TEMPORARY_STORAGE_SCRIPT = """(function() {
         if (obj === navigator) return [];
         return result;
     };
+    if (window.__foxyz_spoof) window.__foxyz_spoof(Object.getOwnPropertyNames, _origGOPN);
 
     if (typeof navigator.webkitTemporaryStorage !== 'undefined') return;
     try {
@@ -98,6 +165,7 @@ FP_CONSISTENCY_SCRIPT = """(function() {
         var result;
         try { result = _origParse.call(this, text); } catch(e) { throw e; }
         if (result && typeof result === 'object' && !Array.isArray(result) && typeof text === 'string') {
+
             var keys = Object.keys(result);
             // Detect fptc 13-key fingerprint (first selfFpCollect dispatch from Fptc)
             // These are MD5 hashes: fonts, hardwareConcurrency, language, navigatorPlatform,
@@ -121,6 +189,7 @@ FP_CONSISTENCY_SCRIPT = """(function() {
         }
         return result;
     };
+    if (window.__foxyz_spoof) window.__foxyz_spoof(JSON.parse, _origParse);
 })();"""
 
 # Fix crypto.subtle.digest zone tracking.
@@ -130,13 +199,15 @@ FP_CONSISTENCY_SCRIPT = """(function() {
 # causing the dispatch to not trigger change detection (UI stays "Collecting Data...").
 # Fix: wrap crypto.subtle.digest to return a standard Promise that zone.js CAN track.
 CRYPTO_ZONE_FIX_SCRIPT = """(function() {
-    var _orig = crypto.subtle.digest.bind(crypto.subtle);
+    var _origDigest = crypto.subtle.digest;
+    var _bound = _origDigest.bind(crypto.subtle);
     crypto.subtle.digest = function(algo, data) {
         // Convert native CryptoPromise to a standard Promise (zone.js-trackable)
         return new Promise(function(resolve, reject) {
-            _orig(algo, data).then(resolve, reject);
+            _bound(algo, data).then(resolve, reject);
         });
     };
+    if (window.__foxyz_spoof) window.__foxyz_spoof(crypto.subtle.digest, _origDigest);
 })();"""
 
 # Fix WebSocket zone hang.
@@ -181,6 +252,7 @@ WEBSOCKET_FIX_SCRIPT = """(function() {
         return new _WS(url, protocols);
     };
     try { window.WebSocket.prototype = _WS.prototype; } catch(e) {}
+    if (window.__foxyz_spoof) window.__foxyz_spoof(window.WebSocket, _WS);
 })();"""
 
 def make_font_spoof_script(allowed_fonts: list) -> str:
@@ -219,12 +291,14 @@ def make_font_spoof_script(allowed_fonts: list) -> str:
     try {{
         var ffsProto = Object.getPrototypeOf(document.fonts);
         var _origCheck = ffsProto.check;
+        var _newCheck = function check(font, text) {{
+            return _isAllowed(font);
+        }};
         Object.defineProperty(ffsProto, 'check', {{
-            value: function check(font, text) {{
-                return _isAllowed(font);
-            }},
+            value: _newCheck,
             writable: true, configurable: true, enumerable: true,
         }});
+        if (window.__foxyz_spoof) window.__foxyz_spoof(_newCheck, _origCheck);
     }} catch(e) {{}}
 
     // --- Patch FontFaceSet iteration (for..of, forEach, size, values) ---
@@ -304,8 +378,6 @@ WEBGL_CONTEXT_LOSS_FIX = """(function() {
         // 1. On contextlost: prevent discard + immediately request restore
         canvas.addEventListener('webglcontextlost', function(e) {
             try { e.preventDefault(); } catch(_) {}
-            // Schedule immediate restore — this allows the fingerprint
-            // test promise to continue rather than hang forever
             setTimeout(function() {
                 try {
                     var ext = ctx.getExtension('WEBGL_lose_context');
@@ -318,28 +390,23 @@ WEBGL_CONTEXT_LOSS_FIX = """(function() {
 
         return ctx;
     };
+    if (window.__foxyz_spoof) window.__foxyz_spoof(HTMLCanvasElement.prototype.getContext, _origGetContext);
 
-    // 2. Suppress getError() to return NO_ERROR (0) for invalid enum calls.
-    //    pixelscan queries non-standard enum values (0x012c, 0x0096, etc.)
-    //    that generate INVALID_ENUM (0x0500) — these can cascade into context
-    //    loss on some GPU drivers. Returning 0 stops the cascade.
+    // 2. Suppress getError() for invalid enum calls
     function _wrapGetError(proto) {
         if (!proto || !proto.getError) return;
         var _orig = proto.getError;
         proto.getError = function() {
             var err = 0;
             try { err = _orig.call(this); } catch(_) {}
-            // GL_INVALID_ENUM = 0x0500 → suppress silently
             return err === 0x0500 ? 0 : err;
         };
+        if (window.__foxyz_spoof) window.__foxyz_spoof(proto.getError, _orig);
     }
     try { _wrapGetError(WebGLRenderingContext.prototype); } catch(_) {}
     try { _wrapGetError(WebGL2RenderingContext.prototype); } catch(_) {}
 
     // 3. Stub WEBGL_debug_renderer_info for Firefox 120+
-    //    Camoufox provides the real vendor/renderer via C++ patches.
-    //    But calling getExtension('WEBGL_debug_renderer_info') can return null
-    //    in newer FF, causing a TypeError that crashes the fingerprint script.
     function _wrapGetExtension(proto) {
         if (!proto || !proto.getExtension) return;
         var _orig = proto.getExtension;
@@ -351,6 +418,7 @@ WEBGL_CONTEXT_LOSS_FIX = """(function() {
             }
             return ext;
         };
+        if (window.__foxyz_spoof) window.__foxyz_spoof(proto.getExtension, _orig);
     }
     try { _wrapGetExtension(WebGLRenderingContext.prototype); } catch(_) {}
     try { _wrapGetExtension(WebGL2RenderingContext.prototype); } catch(_) {}
@@ -370,7 +438,7 @@ WEBGL_CONTEXT_LOSS_FIX = """(function() {
 BOTCHECK_AFP_FIX = """(function() {
     'use strict';
     var _origFetch = window.fetch;
-    window.fetch = function(input, init) {
+    window.fetch = function fetch(input, init) {
         var url = typeof input === 'string' ? input : (input && input.url) || String(input);
         var prom = _origFetch.apply(this, arguments);
         if (!url.includes('/s/api/afp')) return prom;
@@ -388,11 +456,22 @@ BOTCHECK_AFP_FIX = """(function() {
             }).catch(function() { return response; });
         });
     };
+    if (window.__foxyz_spoof) window.__foxyz_spoof(window.fetch, _origFetch);
 })();"""
 
 
+# Cleanup script — remove __foxyz_spoof helper after all overrides are registered.
+# Must run LAST after all init scripts and font spoof script.
+STEALTH_CLEANUP_SCRIPT = """(function() {
+    try { delete window.__foxyz_spoof; } catch(e) {}
+})();"""
+
 # Combined init script for all pages (fonts-unaware, static portion)
+# STEALTH_SCRIPT MUST be first — it sets up toString spoofing infrastructure.
+# STEALTH_CLEANUP_SCRIPT MUST be last — it removes the __foxyz_spoof helper.
 _BASE_INIT_SCRIPTS = '\n'.join([
+    STEALTH_SCRIPT,
+    WEBGL_RENDERER_CLEAN_SCRIPT,
     MD5_SCRIPT,
     WEBKIT_TEMPORARY_STORAGE_SCRIPT,
     FP_CONSISTENCY_SCRIPT,
@@ -403,9 +482,10 @@ _BASE_INIT_SCRIPTS = '\n'.join([
 ])
 
 # Legacy alias — used by code that doesn't have a font list yet
-ALL_INIT_SCRIPTS = _BASE_INIT_SCRIPTS
+ALL_INIT_SCRIPTS = _BASE_INIT_SCRIPTS + '\n' + STEALTH_CLEANUP_SCRIPT
 
 
 def make_all_init_scripts(allowed_fonts: list) -> str:
     """Return the full init script bundle with OS-specific font spoofing."""
-    return _BASE_INIT_SCRIPTS + '\n' + make_font_spoof_script(allowed_fonts)
+    font_script = make_font_spoof_script(allowed_fonts)
+    return _BASE_INIT_SCRIPTS + '\n' + font_script + '\n' + STEALTH_CLEANUP_SCRIPT

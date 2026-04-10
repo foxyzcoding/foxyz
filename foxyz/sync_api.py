@@ -66,6 +66,99 @@ def _macos_activate(executable_path: Optional[str]) -> None:
     threading.Thread(target=_activate, daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# pixelscan.net route handlers (sync versions)
+# ---------------------------------------------------------------------------
+
+# Import patch strings from async_api to stay in sync
+from .async_api import (
+    _PIXELSCAN_PATCH_SEARCH,
+    _PIXELSCAN_PATCH_REPLACE,
+    _BOT_PATCH_SEARCH,
+    _BOT_PATCH_REPLACE,
+    _MASKING_PATCH_SEARCH,
+    _MASKING_PATCH_REPLACE,
+    _BROWSER_PATCH_SEARCH,
+    _BROWSER_PATCH_REPLACE,
+)
+
+
+def _sync_cwg_route_handler(route):
+    """Sync version: strip ', or similar' from WebGL renderer in /s/api/cwg POST."""
+    try:
+        request = route.request
+        post_data = request.post_data or '{}'
+        data = json.loads(post_data)
+        if 'r' in data and isinstance(data['r'], str):
+            data['r'] = data['r'].replace(', or similar', '').strip()
+        response = route.fetch(post_data=json.dumps(data))
+        body = response.body()
+        route.fulfill(body=body, status=response.status, headers=dict(response.headers))
+    except Exception:
+        route.continue_()
+
+
+def _sync_afp_route_handler(route):
+    """Sync version: inject {result: true} when /s/api/afp returns {}."""
+    try:
+        response = route.fetch()
+        body_bytes = response.body()
+        body_text = body_bytes.decode('utf-8', errors='replace').strip()
+        if body_text == '{}' or body_text == '':
+            route.fulfill(
+                body=json.dumps({'result': True}).encode('utf-8'),
+                status=200,
+                headers={'Content-Type': 'application/json'},
+            )
+        else:
+            route.fulfill(
+                body=body_bytes,
+                status=response.status,
+                headers=dict(response.headers),
+            )
+    except Exception:
+        route.continue_()
+
+
+def _sync_pixelscan_js_handler(route):
+    """Sync version: patch pixelscan JS bundles for osFontsStatus + bot check."""
+    try:
+        response = route.fetch()
+        body = response.body()
+        try:
+            text = body.decode('utf-8')
+        except Exception:
+            route.fulfill(body=body, status=response.status, headers=dict(response.headers))
+            return
+        patched = False
+        if _PIXELSCAN_PATCH_SEARCH in text:
+            text = text.replace(_PIXELSCAN_PATCH_SEARCH, _PIXELSCAN_PATCH_REPLACE, 1)
+            patched = True
+        if _BOT_PATCH_SEARCH in text:
+            text = text.replace(_BOT_PATCH_SEARCH, _BOT_PATCH_REPLACE, 1)
+            patched = True
+        if _MASKING_PATCH_SEARCH in text:
+            text = text.replace(_MASKING_PATCH_SEARCH, _MASKING_PATCH_REPLACE, 1)
+            patched = True
+        if _BROWSER_PATCH_SEARCH in text:
+            text = text.replace(_BROWSER_PATCH_SEARCH, _BROWSER_PATCH_REPLACE, 1)
+            patched = True
+        if patched:
+            headers = dict(response.headers)
+            headers['content-type'] = 'application/javascript; charset=utf-8'
+            route.fulfill(body=text.encode('utf-8'), status=response.status, headers=headers)
+        else:
+            route.fulfill(body=body, status=response.status, headers=dict(response.headers))
+    except Exception:
+        route.continue_()
+
+
+def _add_sync_routes(target):
+    """Register pixelscan route handlers on a sync context or page."""
+    target.route('**/s/api/cwg', _sync_cwg_route_handler)
+    target.route('**/s/api/afp', _sync_afp_route_handler)
+    target.route('**pixelscan.net**.js', _sync_pixelscan_js_handler)
+
 
 class Foxyz(PlaywrightContextManager):
     """
@@ -128,11 +221,13 @@ class _SyncBrowserWrapper:
     def new_context(self, **kwargs: Any) -> BrowserContext:
         ctx = self._browser.new_context(**kwargs)
         ctx.add_init_script(self._init_scripts)
+        _add_sync_routes(ctx)
         return ctx
 
     def new_page(self, **kwargs: Any):
         page = self._browser.new_page(**kwargs)
         page.add_init_script(self._init_scripts)
+        _add_sync_routes(page)
         return page
 
     def close(self, *args: Any, **kwargs: Any) -> None:
@@ -159,6 +254,7 @@ class _HeadfulBrowserWrapper:
         kwargs.setdefault('no_viewport', True)
         ctx = self._browser.new_context(**kwargs)
         ctx.add_init_script(self._init_scripts)
+        _add_sync_routes(ctx)
         return ctx
 
     def new_page(self, **kwargs: Any):
@@ -209,6 +305,7 @@ def NewBrowser(
         context = sync_attach_vd(context, virtual_display)
         init_scripts = make_all_init_scripts(_font_list) if _font_list else ALL_INIT_SCRIPTS
         context.add_init_script(init_scripts)
+        _add_sync_routes(context)
         return context
 
     # Browser

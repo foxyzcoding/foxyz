@@ -22,3 +22,9 @@ debug_*.png
 screenshot_*.png
 test_*.py
 test_*.json
+
+# Test artifacts
+pixelscan_result.png
+pixelscan_5runs_report.md
+run_*.png
+test_5runs.py
