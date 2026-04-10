@@ -30,5 +30,12 @@ $PYTHON -m pip install --upgrade foxyz
 # 3. Download browser binary
 $PYTHON -m foxyz fetch
 
+# 4. Remove macOS quarantine (bypass "unidentified developer" block)
+FOXYZ_CACHE="$HOME/Library/Caches/foxyz"
+if [ -d "$FOXYZ_CACHE" ]; then
+    echo "Removing macOS quarantine attributes..."
+    xattr -dr com.apple.quarantine "$FOXYZ_CACHE" 2>/dev/null || true
+fi
+
 echo ""
 echo "Done! Foxyz is ready to use."
