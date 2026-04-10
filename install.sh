@@ -26,29 +26,26 @@ echo "Using: $($PYTHON --version)"
 
 # 2. Create venv at ~/.foxyz-env
 VENV_DIR="$HOME/.foxyz-env"
-echo "Setting up virtual environment at $VENV_DIR..."
-$PYTHON -m venv "$VENV_DIR" --clear
+echo "Setting up virtual environment..."
+rm -rf "$VENV_DIR"
+$PYTHON -m venv "$VENV_DIR"
 
-# Always use venv's own python binary directly — never system pip
-VENV_PYTHON="$VENV_DIR/bin/python3"
-
-# 3. Install foxyz using venv python -m pip (guaranteed to use venv's pip)
+# 3. Install foxyz using venv's own pip — isolated from system, no PEP 668 conflict
 echo "Installing foxyz..."
-"$VENV_PYTHON" -m pip install --upgrade pip --quiet
-"$VENV_PYTHON" -m pip install --upgrade foxyz
+"$VENV_DIR/bin/pip" install foxyz
 
 # 4. Download browser binary
 echo "Downloading browser..."
-"$VENV_PYTHON" -m foxyz fetch
+"$VENV_DIR/bin/foxyz" fetch
 
 # 5. Remove macOS quarantine
 FOXYZ_CACHE="$HOME/Library/Caches/foxyz"
 if [ -d "$FOXYZ_CACHE" ]; then
-    echo "Removing macOS quarantine attributes..."
+    echo "Removing macOS quarantine..."
     xattr -dr com.apple.quarantine "$FOXYZ_CACHE" 2>/dev/null || true
 fi
 
-# 6. Add to PATH
+# 6. Add to PATH in shell profile
 SHELL_PROFILE=""
 if [ -f "$HOME/.zshrc" ]; then
     SHELL_PROFILE="$HOME/.zshrc"
@@ -68,8 +65,8 @@ fi
 
 echo ""
 echo "Done! Foxyz is ready to use."
-echo ""
 if [ -n "$SHELL_PROFILE" ]; then
-    echo "Run this to apply changes in current terminal:"
+    echo ""
+    echo "Apply PATH changes:"
     echo "  source $SHELL_PROFILE"
 fi
