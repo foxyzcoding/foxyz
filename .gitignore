@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Local tools
+.claude/
+publish.sh
+
+# Test & debug scripts
+test_*.py
+
+# Test artifacts (screenshots, reports)
+*.png
+*.md
+!README.md
+*.json
+!foxyz/fingerprint-presets.json
+!foxyz/fonts.json
+!foxyz/font_profiles.json
+!foxyz/voices.json
