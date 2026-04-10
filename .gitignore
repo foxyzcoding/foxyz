@@ -22,6 +22,7 @@ test_*.py
 
 # Test artifacts (screenshots, reports)
 *.png
+!foxyz/gui/assets/*.png
 *.md
 !README.md
 *.json
