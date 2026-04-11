@@ -864,7 +864,7 @@ def launch_options(
     debug: Optional[bool] = None,
     virtual_display: Optional[str] = None,
     profile_seed: Optional[int] = None,
-    allow_addon_new_tab: Optional[bool] = None,
+    allow_addon_new_tab: Optional[bool] = True,
     **launch_options: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
@@ -1162,9 +1162,16 @@ def launch_options(
     if main_world_eval:
         set_into(config, 'allowMainWorld', True)
 
-    # Allow extensions to open new tabs
+    # Allow extensions to open new tabs (e.g. MetaMask popup / openOptionsPage).
+    # Guard with _load_properties() so older builds without this property don't
+    # crash in validate_config() with UnknownProperty.
     if allow_addon_new_tab:
-        set_into(config, 'allowAddonNewtab', True)
+        try:
+            _supported_props = _load_properties(path=executable_path)
+        except Exception:
+            _supported_props = {}
+        if 'allowAddonNewtab' in _supported_props:
+            set_into(config, 'allowAddonNewtab', True)
 
     # Set Firefox user preferences
     if block_images:
